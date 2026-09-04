@@ -1,0 +1,18 @@
+{
+  "schema": "trakkin.provider/v1",
+  "id": "dev.trakkin.fixture",
+  "name": "Fixture",
+  "description": "Reference provider for validating the Trakkin provider protocol",
+  "version": "0.0.0",
+  "platforms": [ "linux/amd64", "linux/arm64" ],
+  "requires": {
+    "trakkin-provider-sdk": ">=0.0.0, <1.0.0"
+  },
+  "repo": "https://github.com/trakkin/trakkin-community-providers",
+  "homepage": "https://trakkin.dev",
+  "license": "Apache-2.0",
+  "maintainer": {
+    "name": "Trakkin",
+    "url": "https://trakkin.dev"
+  }
+}
