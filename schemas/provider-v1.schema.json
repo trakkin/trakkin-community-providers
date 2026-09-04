@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trakkin.dev/schemas/provider-v1.schema.json",
+  "title": "Trakkin provider metadata",
+  "description": "Describes one publishable Trakkin provider release, its requirements, and its public metadata",
+  "examples": [
+    {
+      "schema": "trakkin.provider/v1",
+      "id": "dev.trakkin.fixture",
+      "name": "Fixture",
+      "description": "Reference provider for validating the Trakkin provider protocol",
+      "version": "0.0.0",
+      "platforms": [ "linux/amd64", "linux/arm64" ],
+      "requires": {
+        "trakkin": ">=0.0.0, <1.0.0",
+        "trakkin-provider-sdk": "0.0.0",
+        "trakkin-mapping": "0.0.0"
+      },
+      "repo": "https://github.com/trakkin/trakkin-community-providers",
+      "homepage": "https://trakkin.dev",
+      "license": "Apache-2.0",
+      "maintainer": {
+        "name": "Trakkin",
+        "url": "https://trakkin.dev"
+      }
+    }
+  ],
+  "type": "object",
+  "required": [ "schema", "id", "version", "platforms" ],
+  "properties": {
+    "schema": {
+      "const": "trakkin.provider/v1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "platforms": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [ "linux/amd64", "linux/arm64" ]
+      }
+    },
+    "requires": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "trakkin": {
+          "type": "string",
+          "pattern": "^[^\\r\\n]+$",
+          "minLength": 1
+        },
+        "trakkin-provider-sdk": {
+          "type": "string",
+          "pattern": "^[^\\r\\n]+$",
+          "minLength": 1
+        },
+        "trakkin-mapping": {
+          "type": "string",
+          "pattern": "^[^\\r\\n]+$",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[^\\r\\n]+$",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "pattern": "^[^\\r\\n]+$",
+      "minLength": 1
+    },
+    "repo": {
+      "type": "string",
+      "format": "uri"
+    },
+    "homepage": {
+      "type": "string",
+      "format": "uri"
+    },
+    "documentation": {
+      "type": "string",
+      "format": "uri"
+    },
+    "license": {
+      "type": "string",
+      "pattern": "^[^\\r\\n]+$",
+      "minLength": 1
+    },
+    "maintainer": {
+      "type": "object",
+      "required": [ "name" ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[^\\r\\n]+$",
+          "minLength": 1
+        },
+        "email": {
+          "type": "string",
+          "format": "email"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
