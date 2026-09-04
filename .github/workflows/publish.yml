@@ -49,10 +49,12 @@ jobs:
             ' "$metadata"
           )
 
-          echo "provider=$provider" >>"$GITHUB_OUTPUT"
-          echo "version=$version" >>"$GITHUB_OUTPUT"
-          echo "platforms=$platforms" >>"$GITHUB_OUTPUT"
-          echo "qemu_platforms=$qemu_platforms" >>"$GITHUB_OUTPUT"
+          {
+            echo "provider=$provider"
+            echo "version=$version"
+            echo "platforms=$platforms"
+            echo "qemu_platforms=$qemu_platforms"
+          } >>"$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
         if: steps.context.outputs.qemu_platforms != ''
         with:
