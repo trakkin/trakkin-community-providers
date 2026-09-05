@@ -1,0 +1,88 @@
+[settings]
+lockfile = true
+minimum_release_age = "3d"
+
+[tools]
+"cargo:cargo-edit" = { version = "0.13.13", default-features = false, features = "upgrade" }
+"github:kjanat/actionlint" = "1.13.0"
+"github:oras-project/oras" = "1.3.4"
+"npm:actions-up" = "1.18.0"
+jq = "1.8.1"
+node = "26.7.0"
+"jsonschema" = "16.9.0"
+rust = { version = "1.97.1", components = "rustfmt,clippy" }
+
+[tasks.build]
+description = "Build every community provider"
+run = [{ task = "provider:build", args = ["fixture"] }]
+
+[tasks."provider:build"]
+description = "Build one community provider artifact"
+usage = 'arg "<provider>" help="Provider directory name"'
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+provider="${usage_provider?}"
+[[ "$provider" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]
+[[ -f "providers/$provider/Cargo.toml" ]]
+
+docker buildx build \
+  --target artifact \
+  --output "type=local,dest=dist/$provider" \
+  "providers/$provider"
+'''
+
+[tasks.check]
+description = "Check workflows, metadata, publisher, and every community provider"
+run = [{ tasks = ["workflows:check", "metadata:check", "publisher:check"] }]
+
+[tasks."workflows:check"]
+description = "Check GitHub Actions workflows"
+run = "actionlint"
+
+[tasks."metadata:check"]
+description = "Check the provider schema and metadata documents"
+run = [
+  "jsonschema fmt --check schemas/provider-v1.schema.json",
+  "jsonschema metaschema schemas/provider-v1.schema.json",
+  "jsonschema lint --exclude simple_properties_identifiers schemas/provider-v1.schema.json",
+  "jsonschema validate --format-assertion schemas/provider-v1.schema.json providers/*/provider.json",
+]
+
+[tasks."publisher:check"]
+description = "Check the publisher script syntax"
+run = "bash -n scripts/publish"
+
+[tasks."server:start"]
+description = "Start the local OCI registry server and wait until it is healthy"
+run = "docker compose --file compose.dev.yml up --detach --wait registry"
+
+[tasks."server:publish"]
+description = "Build and publish providers to the local OCI registry server"
+raw_args = true
+run = "scripts/publish"
+
+[tasks."server:stop"]
+description = "Stop the local OCI registry server"
+run = "docker compose --file compose.dev.yml down"
+
+[tasks."server:reset"]
+description = "Stop the local OCI registry server and delete its artifacts"
+run = "docker compose --file compose.dev.yml down --volumes"
+
+[tasks.test]
+description = "Testing (currently a no-op)"
+run = []
+
+[tasks.update]
+description = "Update the toolchain, workflows, and every provider"
+run = [{ task = "toolchain:update" }, { task = "workflows:update" }]
+
+[tasks."workflows:update"]
+description = "Update and SHA-pin GitHub Actions dependencies"
+run = "actions-up --yes"
+
+[tasks."toolchain:update"]
+description = "Update mise-managed tools"
+run = "mise upgrade --bump"

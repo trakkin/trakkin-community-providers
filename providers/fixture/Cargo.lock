@@ -1189,7 +1189,7 @@ dependencies = [
 [[package]]
 name = "trakkin-mapping"
 version = "0.0.0"
-source = "git+https://github.com/trakkin/trakkin-contracts.git?rev=6c2a576625e3c99491e45b7485a9aa0f99e69cb5#6c2a576625e3c99491e45b7485a9aa0f99e69cb5"
+source = "git+https://github.com/trakkin/trakkin-contracts.git?rev=0ab27764ba736ca4f6404a54a50266611537070d#0ab27764ba736ca4f6404a54a50266611537070d"
 dependencies = [
  "semver",
  "serde",
@@ -1219,7 +1219,7 @@ dependencies = [
 [[package]]
 name = "trakkin-provider-sdk"
 version = "0.0.0"
-source = "git+https://github.com/trakkin/trakkin-contracts.git?rev=6c2a576625e3c99491e45b7485a9aa0f99e69cb5#6c2a576625e3c99491e45b7485a9aa0f99e69cb5"
+source = "git+https://github.com/trakkin/trakkin-contracts.git?rev=0ab27764ba736ca4f6404a54a50266611537070d#0ab27764ba736ca4f6404a54a50266611537070d"
 dependencies = [
  "prost",
  "prost-types",

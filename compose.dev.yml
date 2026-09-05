@@ -1,0 +1,16 @@
+name: trakkin-community-providers
+
+services:
+  registry:
+    image: docker.io/library/registry:3.1.1@sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33
+    ports:
+      - 5000:5000
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:5000/v2/"]
+    volumes:
+      - registry:/var/lib/registry
+
+volumes:
+  registry:

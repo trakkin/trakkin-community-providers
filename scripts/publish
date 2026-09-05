@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly ARTIFACT_TYPE="application/vnd.trakkin.provider.v1"
+readonly BINARY_TYPE="application/vnd.trakkin.provider.binary.v1"
+readonly METADATA_TYPE="application/vnd.trakkin.provider.metadata.v1+json"
+readonly REPOSITORY_PATH="trakkin/trakkin-community-providers-v1"
+readonly ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+readonly SCHEMA_PATH="$ROOT_DIR/schemas/provider-v1.schema.json"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_commands() {
+  local command
+  for command in "$@"; do
+    command -v "$command" >/dev/null || die "missing required command '$command'; run this command through mise"
+  done
+}
+
+valid_slug() {
+  [[ "$1" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]
+}
+
+valid_digest() {
+  [[ "$1" =~ ^sha256:[[:xdigit:]]{64}$ ]]
+}
+
+repository_for_port() {
+  printf '127.0.0.1:%s/%s\n' "$1" "$REPOSITORY_PATH"
+}
+
+normalize_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || die "invalid registry port '$value'"
+
+  local port=$((10#$value))
+  ((port > 0 && port <= 65535)) || die "invalid registry port '$value'"
+  printf '%d\n' "$port"
+}
+
+metadata_annotation_lines() {
+  jq -r '
+    to_entries[]
+    | "dev.trakkin.provider.\(.key)=\(
+        .value
+        | if type == "string" then . else tojson end
+      )"
+  ' "$1"
+}
+
+wait_for_server() {
+  local port="$1"
+  local deadline=$((SECONDS + 10))
+  local status
+
+  while ((SECONDS < deadline)); do
+    status=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 1 \
+      "http://127.0.0.1:$port/v2/") || status=""
+    if [[ "$status" == "200" || "$status" == "401" ]]; then
+      return
+    fi
+    sleep 0.2
+  done
+
+  die "local registry at http://127.0.0.1:$port is not ready; run 'mise run server:start'"
+}
+
+load_providers() {
+  local -n result="$1"
+  shift
+
+  if (($# > 0)); then
+    result=("$@")
+  else
+    local directory
+    shopt -s dotglob nullglob
+    for directory in "$ROOT_DIR"/providers/*; do
+      [[ -d "$directory" ]] && result+=("${directory##*/}")
+    done
+    shopt -u dotglob nullglob
+  fi
+
+  ((${#result[@]} > 0)) || die "no providers were found"
+
+  local provider
+  for provider in "${result[@]}"; do
+    valid_slug "$provider" || die "invalid provider directory name '$provider'"
+  done
+
+  local sorted
+  sorted=$(printf '%s\n' "${result[@]}" | LC_ALL=C sort -u)
+  mapfile -t result <<<"$sorted"
+}
+
+publish_provider() {
+  local provider="$1"
+  local registry_port="$2"
+  local platform="$3"
+  local platform_directory="$4"
+  local commit="$5"
+  local created_at="$6"
+  local directory="$ROOT_DIR/providers/$provider"
+  local metadata="$directory/provider.json"
+
+  [[ -f "$directory/Dockerfile" ]] || die "provider '$provider' has no Dockerfile"
+  [[ -f "$metadata" ]] || die "provider '$provider' has no provider.json"
+
+  jsonschema validate --format-assertion "$SCHEMA_PATH" "$metadata"
+
+  local id version source_url
+  id=$(jq -er '.id | select(type == "string")' "$metadata") || die "provider '$provider' has no string id"
+  version=$(jq -er '.version | select(type == "string")' "$metadata") || die "provider '$provider' has no string version"
+  source_url=$(jq -er '.repo | select(type == "string")' "$metadata") || die "provider '$provider' has no string repo"
+  jq -e --arg platform "$platform" '.platforms | index($platform) != null' "$metadata" >/dev/null \
+    || die "provider '$provider' does not support $platform"
+
+  local artifact_directory="$ROOT_DIR/dist/local/$provider/$platform_directory"
+  [[ "$artifact_directory" == "$ROOT_DIR/dist/local/"* ]] || die "invalid artifact directory"
+  rm -rf -- "$artifact_directory"
+  mkdir -p -- "$artifact_directory"
+
+  docker buildx build \
+    --target artifact \
+    --platform "$platform" \
+    --output "type=local,dest=$artifact_directory,platform-split=false" \
+    "$directory"
+
+  [[ -f "$artifact_directory/provider" ]] \
+    || die "provider build did not produce '$artifact_directory/provider'"
+  [[ -x "$artifact_directory/provider" ]] \
+    || die "provider build produced a non-executable '$artifact_directory/provider'"
+  cp -- "$metadata" "$artifact_directory/provider.json"
+
+  local -a annotations=(
+    --annotation "org.opencontainers.image.title=$provider"
+    --annotation "org.opencontainers.image.version=$version"
+    --annotation "org.opencontainers.image.source=$source_url"
+    --annotation "org.opencontainers.image.revision=$commit"
+    --annotation "org.opencontainers.image.created=$created_at"
+  )
+  local metadata_annotations
+  metadata_annotations=$(metadata_annotation_lines "$metadata")
+  local annotation
+  while IFS= read -r annotation; do
+    annotations+=(--annotation "$annotation")
+  done <<<"$metadata_annotations"
+
+  local repository platform_tag release_tag platform_digest digest
+  repository=$(repository_for_port "$registry_port")
+  platform_tag="$id-platform-$version-${platform%/*}-${platform#*/}"
+  release_tag="$id-v$version"
+  platform_digest=$(
+    cd "$artifact_directory"
+    oras push \
+      --plain-http \
+      --format 'go-template={{.digest}}' \
+      --artifact-type "$ARTIFACT_TYPE" \
+      --artifact-platform "$platform" \
+      "${annotations[@]}" \
+      "$repository:$platform_tag" \
+      "provider.json:$METADATA_TYPE" \
+      "provider:$BINARY_TYPE"
+  )
+  valid_digest "$platform_digest" || die "ORAS returned invalid digest '$platform_digest'"
+
+  oras manifest index create \
+    --plain-http \
+    --artifact-type "$ARTIFACT_TYPE" \
+    "${annotations[@]}" \
+    "$repository:$release_tag" \
+    "$platform_digest"
+
+  digest=$(oras resolve --plain-http "$repository:$release_tag")
+  valid_digest "$digest" || die "ORAS returned invalid digest '$digest'"
+  printf '  %s v%s -> %s\n' "$id" "$version" "$digest"
+}
+
+publish() {
+  local registry_port="$1"
+  shift
+
+  require_commands curl docker git jq jsonschema oras
+  wait_for_server "$registry_port"
+
+  [[ "$(uname -s)" == "Linux" ]] || die "local providers can only be built for Linux"
+  local architecture
+  case "$(uname -m)" in
+    x86_64) architecture="amd64" ;;
+    aarch64) architecture="arm64" ;;
+    *) die "unsupported local provider architecture '$(uname -m)'" ;;
+  esac
+  local platform="linux/$architecture"
+  local platform_directory="linux_$architecture"
+
+  local revision
+  revision=$(git -C "$ROOT_DIR" show --no-patch --format='%H%n%cI' HEAD)
+  local -a revision_lines
+  mapfile -t revision_lines <<<"$revision"
+  ((${#revision_lines[@]} == 2)) || die "Git returned unexpected revision metadata"
+  [[ -n "${revision_lines[0]}" ]] || die "Git returned no commit"
+  [[ -n "${revision_lines[1]}" ]] || die "Git returned no commit timestamp"
+
+  local -a providers=()
+  load_providers providers "$@"
+  printf 'Publishing %d provider(s) for %s\n' "${#providers[@]}" "$platform"
+
+  local provider
+  for provider in "${providers[@]}"; do
+    publish_provider \
+      "$provider" \
+      "$registry_port" \
+      "$platform" \
+      "$platform_directory" \
+      "${revision_lines[0]}" \
+      "${revision_lines[1]}"
+  done
+
+  printf 'Provider source: http://%s\n' "$(repository_for_port "$registry_port")"
+}
+
+print_help() {
+  cat <<'EOF'
+Usage: publish [--registry-port PORT] [PROVIDER...]
+
+Build and publish providers for the current host platform. Every provider is
+published when no provider directory names are supplied.
+
+Options:
+  --registry-port PORT  Local registry port (default: 5000)
+  -h, --help            Show this help
+EOF
+}
+
+main() {
+  local registry_port="${TRAKKIN_DEV_REGISTRY_PORT-5000}"
+  local -a providers=()
+
+  while (($# > 0)); do
+    case "$1" in
+      --registry-port)
+        (($# > 1)) || die "--registry-port requires a value"
+        registry_port="$2"
+        shift 2
+        ;;
+      --registry-port=*)
+        registry_port="${1#*=}"
+        shift
+        ;;
+      -h|--help)
+        print_help
+        return
+        ;;
+      --)
+        shift
+        providers+=("$@")
+        break
+        ;;
+      -*) die "unknown option '$1'" ;;
+      *)
+        providers+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  registry_port=$(normalize_port "$registry_port")
+  publish "$registry_port" "${providers[@]}"
+}
+
+main "$@"

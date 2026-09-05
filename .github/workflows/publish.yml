@@ -11,7 +11,7 @@ env:
   ARTIFACT_TYPE: application/vnd.trakkin.provider.v1
   BINARY_TYPE: application/vnd.trakkin.provider.binary.v1
   METADATA_TYPE: application/vnd.trakkin.provider.metadata.v1+json
-  REGISTRY: ghcr.io/trakkin/trakkin-community-providers-v1
+  REGISTRY_REPO: ghcr.io/trakkin/trakkin-community-providers-v1
 
 jobs:
   build:
@@ -49,10 +49,12 @@ jobs:
             ' "$metadata"
           )
 
-          echo "provider=$provider" >>"$GITHUB_OUTPUT"
-          echo "version=$version" >>"$GITHUB_OUTPUT"
-          echo "platforms=$platforms" >>"$GITHUB_OUTPUT"
-          echo "qemu_platforms=$qemu_platforms" >>"$GITHUB_OUTPUT"
+          {
+            echo "provider=$provider"
+            echo "version=$version"
+            echo "platforms=$platforms"
+            echo "qemu_platforms=$qemu_platforms"
+          } >>"$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
         if: steps.context.outputs.qemu_platforms != ''
         with:
@@ -111,10 +113,12 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
           PLATFORMS: ${{ needs.build.outputs.platforms }}
         run: |
-          release="$PROVIDER.version.$VERSION"
+          repository="$REGISTRY_REPO"
           IFS=, read -ra platforms <<<"$PLATFORMS"
           ((${#platforms[@]} > 0))
           metadata="dist/${platforms[0]//\//_}/provider.json"
+          provider_id=$(jq -er '.id' "$metadata")
+          release="$provider_id-v$VERSION"
           refs=()
           annotations=(
             --annotation "org.opencontainers.image.title=$PROVIDER"
@@ -140,14 +144,14 @@ jobs:
             os=${platform%%/*}
             arch=${platform#*/}
 
-            tag="$PROVIDER.platform.$VERSION.${os}-${arch}"
+            tag="$provider_id-platform-$VERSION-${os}-${arch}"
             digest=$(
               cd "$dir"
               oras push --format 'go-template={{.digest}}' \
                 --artifact-type "$ARTIFACT_TYPE" \
                 --artifact-platform "$os/$arch" \
                 "${annotations[@]}" \
-                "$REGISTRY:$tag" \
+                "$repository:$tag" \
                 "provider.json:$METADATA_TYPE" \
                 "provider:$BINARY_TYPE"
             )
@@ -157,13 +161,16 @@ jobs:
 
           oras manifest index create --artifact-type "$ARTIFACT_TYPE" \
             "${annotations[@]}" \
-            "$REGISTRY:$release" "${refs[@]}"
+            "$repository:$release" "${refs[@]}"
 
-          echo "digest=$(oras resolve "$REGISTRY:$release")" >>"$GITHUB_OUTPUT"
+          {
+            echo "repository=$repository"
+            echo "digest=$(oras resolve "$repository:$release")"
+          } >>"$GITHUB_OUTPUT"
       - name: Attest OCI index
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ${{ env.REGISTRY }}
+          subject-name: ${{ steps.push.outputs.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
           create-storage-record: false
