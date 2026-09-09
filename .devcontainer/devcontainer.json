@@ -3,7 +3,9 @@
   "name": "trakkin-community-providers",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu26.04",
   "features": {
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": false
+    },
     "ghcr.io/devcontainers-extra/features/mise:1": {}
   },
   "customizations": {
