@@ -14,7 +14,10 @@ rust = { version = "1.97.1", components = "rustfmt,clippy" }
 
 [tasks.build]
 description = "Build every community provider"
-run = [{ task = "provider:build", args = ["fixture"] }]
+run = [
+  { task = "provider:build", args = ["fixture"] },
+  { task = "provider:build", args = ["plex"] },
+]
 
 [tasks."provider:build"]
 description = "Build one community provider artifact"

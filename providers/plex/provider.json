@@ -1,0 +1,19 @@
+{
+  "schema": "trakkin.provider/v1",
+  "id": "dev.trakkin.plex",
+  "name": "Plex",
+  "description": "Plex Media Server catalog and watch-state provider",
+  "version": "0.0.0",
+  "platforms": [ "linux/amd64", "linux/arm64" ],
+  "requires": {
+    "trakkin-provider-sdk": ">=0.0.0, <1.0.0"
+  },
+  "repo": "https://github.com/trakkin/trakkin-community-providers",
+  "homepage": "https://www.plex.tv",
+  "documentation": "https://developer.plex.tv/pms/",
+  "license": "Apache-2.0",
+  "maintainer": {
+    "name": "Trakkin",
+    "url": "https://trakkin.dev"
+  }
+}
