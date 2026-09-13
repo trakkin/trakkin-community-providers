@@ -511,7 +511,8 @@ async fn bootstrap_token_auth_and_empty_receiver_flow_cross_process_boundary() {
     let requested = reference("media/quiet-signal");
     let request = fixture.signed(LookupPortableReferencesRequest {
         operation_id: b"lookup-empty-receiver".to_vec(),
-        references: vec![requested],
+        references: vec![requested.clone()],
+        source_key: Some(key("source.receiver.empty")),
     });
     let lookup = fixture
         .client
@@ -527,14 +528,34 @@ async fn bootstrap_token_auth_and_empty_receiver_flow_cross_process_boundary() {
         Some(portable_reference_lookup_result::Outcome::Matched(_))
     ));
 
+    let request = fixture.signed(LookupPortableReferencesRequest {
+        operation_id: b"lookup-sibling-source".to_vec(),
+        references: vec![requested.clone()],
+        source_key: Some(key("source.lookup.catalog")),
+    });
+    let lookup = fixture
+        .client
+        .lookup_portable_references(request)
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(lookup_portable_references_response::Outcome::Result(lookup)) = lookup.outcome else {
+        panic!("fixture sibling-source lookup failed");
+    };
+    assert!(lookup.results.iter().all(|result| matches!(
+        result.outcome,
+        Some(portable_reference_lookup_result::Outcome::Unsupported(_))
+    )));
+
     let requested = PortableEndpoint {
-        reference: Some(reference("media/quiet-signal")),
+        reference: Some(requested),
         selector: "segment:1..12".to_owned(),
     };
     let request = fixture.signed(ResolvePortableEndpointsRequest {
         operation_id: b"resolve-empty-receiver".to_vec(),
         endpoints: vec![requested.clone()],
         maximum_response_bytes: 4096,
+        source_key: Some(key("source.receiver.empty")),
     });
     let resolution = fixture
         .client
@@ -557,6 +578,27 @@ async fn bootstrap_token_auth_and_empty_receiver_flow_cross_process_boundary() {
         candidate.binding.as_ref().unwrap().backing,
         CoordinateBacking::Aggregate as i32
     );
+
+    let request = fixture.signed(ResolvePortableEndpointsRequest {
+        operation_id: b"resolve-sibling-source".to_vec(),
+        endpoints: vec![requested.clone()],
+        maximum_response_bytes: 4096,
+        source_key: Some(key("source.lookup.catalog")),
+    });
+    let resolution = fixture
+        .client
+        .resolve_portable_endpoints(request)
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(resolve_portable_endpoints_response::Outcome::Result(resolution)) = resolution.outcome
+    else {
+        panic!("fixture sibling-source endpoint resolution failed");
+    };
+    assert!(matches!(
+        resolution.results[0].outcome,
+        Some(portable_endpoint_resolution::Outcome::Unsupported(_))
+    ));
     fixture.shutdown().await;
 }
 
@@ -709,6 +751,7 @@ async fn declared_faults_have_deterministic_contract_outcomes() {
     let request = fixture.signed(LookupPortableReferencesRequest {
         operation_id: b"adversarial-lookup".to_vec(),
         references: requested.to_vec(),
+        source_key: Some(key("source.adversarial.lookup")),
     });
     let lookup = fixture
         .client

@@ -497,11 +497,14 @@ impl AdapterService for FixtureAdapter {
         request: Request<LookupPortableReferencesRequest>,
     ) -> Result<Response<LookupPortableReferencesResponse>, Status> {
         let request = request.into_inner();
-        if request.operation_id.is_empty() {
-            return Err(Status::invalid_argument("operation ID is required"));
-        }
+        validation::lookup_request(&request)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let scenario = self.scenario().await?;
-        let response = scenario.lookup(&request.references);
+        let source_key = request.source_key.as_ref().expect("validated source key");
+        scenario
+            .ensure_source(source_key)
+            .map_err(|_| Status::not_found("source is unknown"))?;
+        let response = scenario.lookup(source_key, &request.references);
         validation::lookup_response(&request.references, &response)
             .map_err(|error| Status::internal(error.to_string()))?;
         Ok(Response::new(response))
@@ -515,8 +518,12 @@ impl AdapterService for FixtureAdapter {
         validation::resolve_endpoints_request(&request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let scenario = self.scenario().await?;
+        let source_key = request.source_key.as_ref().expect("validated source key");
+        scenario
+            .ensure_source(source_key)
+            .map_err(|_| Status::not_found("source is unknown"))?;
         let maximum_response_bytes = request.maximum_response_bytes.min(65_536);
-        let response = scenario.resolve_endpoints(&request.endpoints);
+        let response = scenario.resolve_endpoints(source_key, &request.endpoints);
         validation::resolve_endpoints_response(
             &request.endpoints,
             &response,

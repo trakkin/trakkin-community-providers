@@ -360,12 +360,17 @@ impl Scenario {
         Ok(events)
     }
 
-    pub fn lookup(&self, references: &[PortableReference]) -> LookupPortableReferencesResponse {
+    pub fn lookup(
+        &self,
+        source_key: &Key,
+        references: &[PortableReference],
+    ) -> LookupPortableReferencesResponse {
+        let source = text_key(source_key).ok();
         let results = references
             .iter()
             .map(|requested| PortableReferenceLookupResult {
                 requested: Some(requested.clone()),
-                outcome: Some(self.lookup_outcome(requested)),
+                outcome: Some(self.lookup_outcome(source, requested)),
             })
             .collect();
         LookupPortableReferencesResponse {
@@ -377,13 +382,15 @@ impl Scenario {
 
     pub fn resolve_endpoints(
         &self,
+        source_key: &Key,
         endpoints: &[PortableEndpoint],
     ) -> ResolvePortableEndpointsResponse {
+        let source = text_key(source_key).ok();
         let results = endpoints
             .iter()
             .map(|requested| PortableEndpointResolution {
                 requested: Some(requested.clone()),
-                outcome: Some(self.endpoint_lookup_outcome(requested)),
+                outcome: Some(self.endpoint_lookup_outcome(source, requested)),
             })
             .collect();
         ResolvePortableEndpointsResponse {
@@ -678,7 +685,7 @@ impl Scenario {
         }
     }
 
-    fn ensure_source(&self, requested: &Key) -> Result<(), ScenarioError> {
+    pub fn ensure_source(&self, requested: &Key) -> Result<(), ScenarioError> {
         if self
             .sources()
             .iter()
@@ -1224,10 +1231,14 @@ impl Scenario {
 
     fn lookup_outcome(
         &self,
+        source: Option<&str>,
         requested: &PortableReference,
     ) -> portable_reference_lookup_result::Outcome {
         let value = String::from_utf8_lossy(&requested.value);
-        if self.settings.scenario_id == EMPTY_TARGETED_RECEIVER && value == "media/quiet-signal" {
+        if self.settings.scenario_id == EMPTY_TARGETED_RECEIVER
+            && source == Some("source.receiver.empty")
+            && value == "media/quiet-signal"
+        {
             return portable_reference_lookup_result::Outcome::Matched(LookupMatched {
                 candidate: Some(candidate(
                     "media.quiet-signal",
@@ -1237,7 +1248,10 @@ impl Scenario {
                 )),
             });
         }
-        if self.settings.scenario_id == EMPTY_TARGETED_RECEIVER && value == "media/linked" {
+        if self.settings.scenario_id == EMPTY_TARGETED_RECEIVER
+            && source == Some("source.lookup.catalog")
+            && value == "media/linked"
+        {
             return portable_reference_lookup_result::Outcome::Ambiguous(LookupAmbiguous {
                 candidates: vec![
                     candidate(
@@ -1255,7 +1269,7 @@ impl Scenario {
                 ],
             });
         }
-        if self.settings.scenario_id == ADVERSARIAL {
+        if self.settings.scenario_id == ADVERSARIAL && source == Some("source.adversarial.lookup") {
             return match value.as_ref() {
                 "duplicate" => {
                     portable_reference_lookup_result::Outcome::Ambiguous(LookupAmbiguous {
@@ -1284,6 +1298,7 @@ impl Scenario {
 
     fn endpoint_lookup_outcome(
         &self,
+        source: Option<&str>,
         requested: &PortableEndpoint,
     ) -> portable_endpoint_resolution::Outcome {
         let Some(reference) = requested.reference.as_ref() else {
@@ -1291,6 +1306,7 @@ impl Scenario {
         };
         let value = String::from_utf8_lossy(&reference.value);
         if self.settings.scenario_id == EMPTY_TARGETED_RECEIVER
+            && source == Some("source.receiver.empty")
             && matches!(value.as_ref(), "quiet-signal" | "media/quiet-signal")
             && requested.selector == "segment:1..12"
         {
@@ -1305,6 +1321,7 @@ impl Scenario {
             });
         }
         if self.settings.scenario_id == EMPTY_TARGETED_RECEIVER
+            && source == Some("source.lookup.catalog")
             && value == "media/linked"
             && requested.selector == "segment:1..24"
         {
@@ -1327,7 +1344,10 @@ impl Scenario {
                 ],
             });
         }
-        if self.settings.scenario_id == ADVERSARIAL && value == "missing" {
+        if self.settings.scenario_id == ADVERSARIAL
+            && source == Some("source.adversarial.lookup")
+            && value == "missing"
+        {
             return portable_endpoint_resolution::Outcome::NotFound(LookupNotFound {});
         }
         portable_endpoint_resolution::Outcome::Unsupported(LookupUnsupported {})
@@ -1501,11 +1521,16 @@ fn provider_item_subject(value: &str) -> SubjectReference {
 }
 
 fn item(id: &str, kind: &str, display_name: &str, references: &[&str]) -> ProviderItem {
+    let references = references
+        .iter()
+        .map(|value| reference(value))
+        .collect::<Vec<_>>();
     ProviderItem {
         key: Some(key(id)),
         kind: Some(term(kind)),
         display_name: display_name.to_owned(),
-        portable_references: references.iter().map(|value| reference(value)).collect(),
+        portable_reference_candidates: references.clone(),
+        recommended_mapping_roots: references,
         ..ProviderItem::default()
     }
 }
@@ -1813,8 +1838,15 @@ fn candidate(
     requested: &PortableReference,
     revision: &str,
 ) -> LookupCandidate {
+    let mut provider_item = item(id, "media", display_name, &[]);
+    provider_item
+        .portable_reference_candidates
+        .push(requested.clone());
+    provider_item
+        .recommended_mapping_roots
+        .push(requested.clone());
     LookupCandidate {
-        provider_item: Some(item(id, "media", display_name, &[])),
+        provider_item: Some(provider_item),
         evidence: Some(LookupEvidence {
             adapter_revision: revision.as_bytes().to_vec(),
             observed_time_milliseconds: LOGICAL_TIME_MILLISECONDS,
@@ -1835,8 +1867,15 @@ fn endpoint_candidate(
         .reference
         .clone()
         .expect("fixture endpoint reference is present");
+    let mut provider_item = item(id, "media", display_name, &[]);
+    provider_item
+        .portable_reference_candidates
+        .push(reference.clone());
+    provider_item
+        .recommended_mapping_roots
+        .push(reference.clone());
     EndpointLookupCandidate {
-        provider_item: Some(item(id, "media", display_name, &[])),
+        provider_item: Some(provider_item),
         binding: Some(CoordinateBinding {
             endpoint: Some(requested.clone()),
             subject: Some(SubjectReference {
@@ -1977,7 +2016,10 @@ mod tests {
         assert!(batch.item_upserts.is_empty());
 
         let requested = reference("media/quiet-signal");
-        let response = scenario.lookup(std::slice::from_ref(&requested));
+        let response = scenario.lookup(
+            receiver.key.as_ref().unwrap(),
+            std::slice::from_ref(&requested),
+        );
         lookup_response(&[requested], &response).unwrap();
         let Some(lookup_portable_references_response::Outcome::Result(result)) =
             response.outcome.as_ref()
@@ -1993,7 +2035,10 @@ mod tests {
             reference: Some(reference("media/quiet-signal")),
             selector: "segment:1..12".to_owned(),
         };
-        let response = scenario.resolve_endpoints(std::slice::from_ref(&requested_endpoint));
+        let response = scenario.resolve_endpoints(
+            receiver.key.as_ref().unwrap(),
+            std::slice::from_ref(&requested_endpoint),
+        );
         resolve_endpoints_response(std::slice::from_ref(&requested_endpoint), &response, 4096)
             .unwrap();
         let Some(resolve_portable_endpoints_response::Outcome::Result(result)) =
@@ -2228,7 +2273,7 @@ mod tests {
             reference("duplicate"),
             reference("other"),
         ];
-        let response = scenario.lookup(&references);
+        let response = scenario.lookup(&key("source.adversarial.lookup"), &references);
         lookup_response(&references, &response).unwrap();
         let Some(lookup_portable_references_response::Outcome::Result(result)) =
             response.outcome.as_ref()

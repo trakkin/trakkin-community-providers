@@ -26,7 +26,7 @@ tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 tonic = "0.14.6"
 tracing = "0.1.44"
-trakkin-provider-sdk = { git = "https://github.com/trakkin/trakkin-contracts.git", rev = "0ab27764ba736ca4f6404a54a50266611537070d", version = "0.0.0" }
+trakkin-provider-sdk = { git = "https://github.com/trakkin/trakkin-contracts.git", rev = "d543d88f559f7a0a1a35369712608a9d47485ed4", version = "0.0.0" }
 
 [dev-dependencies]
 serde_json = "1.0.150"
