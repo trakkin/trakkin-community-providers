@@ -34,6 +34,15 @@ pub const WATCHED_FIELD: &str = "watched";
 pub const PROGRESS_FIELD: &str = "progress";
 pub const RATING_FIELD: &str = "rating";
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RecommendationPolicy {
+    #[default]
+    None,
+    Movie,
+    SeriesTmdb,
+    SeriesTvdb,
+}
+
 pub fn key(value: impl AsRef<[u8]>) -> Key {
     Key {
         namespace: KEY_NAMESPACE.to_owned(),
@@ -79,7 +88,10 @@ pub fn term(namespace: &str, name: impl Into<String>) -> Term {
     }
 }
 
-pub fn provider_item(item: &MediaItem) -> ProviderItem {
+pub fn provider_item(
+    item: &MediaItem,
+    recommendation_policy: RecommendationPolicy,
+) -> ProviderItem {
     let mut attributes = Vec::new();
     push_text_attribute(&mut attributes, "summary", item.summary.as_deref());
     push_integer_attribute(&mut attributes, "duration", item.duration);
@@ -103,7 +115,8 @@ pub fn provider_item(item: &MediaItem) -> ProviderItem {
         assets.push(asset_reference("backdrop"));
     }
 
-    let (portable_reference_candidates, recommended_mapping_roots) = portable_references(item);
+    let (portable_reference_candidates, recommended_mapping_roots) =
+        portable_references(item, recommendation_policy);
     ProviderItem {
         key: Some(item_key(&item.rating_key)),
         kind: Some(term(MEDIA_NAMESPACE, item.media_type.clone())),
@@ -126,25 +139,44 @@ pub fn catalog_relation(item: &MediaItem, position: usize) -> CatalogRelation {
     }
 }
 
-fn portable_references(item: &MediaItem) -> (Vec<PortableReference>, Vec<PortableReference>) {
-    let recommended_mapping_roots = item
+fn portable_references(
+    item: &MediaItem,
+    recommendation_policy: RecommendationPolicy,
+) -> (Vec<PortableReference>, Vec<PortableReference>) {
+    let primary_reference = item
         .guid
         .as_deref()
-        .and_then(|guid| portable_reference(guid, &item.media_type))
-        .into_iter()
-        .collect::<Vec<_>>();
+        .and_then(|guid| portable_reference(guid, &item.media_type));
     let mut seen = HashSet::new();
-    let portable_reference_candidates = recommended_mapping_roots
-        .iter()
-        .cloned()
+    let portable_reference_candidates = primary_reference
+        .into_iter()
         .chain(
             item.guids
                 .iter()
                 .filter_map(|guid| portable_reference(&guid.id, &item.media_type)),
         )
         .filter(|reference| seen.insert((reference.namespace.clone(), reference.value.clone())))
+        .collect::<Vec<_>>();
+    let recommended_mapping_roots = portable_reference_candidates
+        .iter()
+        .filter(|reference| recommendation_policy.recommends(reference))
+        .cloned()
         .collect();
     (portable_reference_candidates, recommended_mapping_roots)
+}
+
+impl RecommendationPolicy {
+    fn recommends(self, reference: &PortableReference) -> bool {
+        match self {
+            Self::None => false,
+            Self::Movie => matches!(
+                reference.namespace.as_str(),
+                IMDB_REFERENCE_NAMESPACE | TMDB_REFERENCE_NAMESPACE | TVDB_REFERENCE_NAMESPACE
+            ),
+            Self::SeriesTmdb => reference.namespace == TMDB_REFERENCE_NAMESPACE,
+            Self::SeriesTvdb => reference.namespace == TVDB_REFERENCE_NAMESPACE,
+        }
+    }
 }
 
 pub fn portable_reference(guid: &str, media_type: &str) -> Option<PortableReference> {
@@ -501,6 +533,7 @@ mod tests {
             guid: Some("plex://episode/abc".to_owned()),
             media_type: "episode".to_owned(),
             title: "Pilot".to_owned(),
+            show_ordering: None,
             parent_title: Some("Season 1".to_owned()),
             grandparent_title: Some("A Show".to_owned()),
             summary: Some("Summary".to_owned()),
@@ -529,7 +562,7 @@ mod tests {
     #[test]
     fn maps_hierarchy_references_assets_and_state() {
         let episode = episode();
-        let item = provider_item(&episode);
+        let item = provider_item(&episode, RecommendationPolicy::None);
         assert_eq!(item.display_name, "A Show - Season 1 - Pilot");
         assert_eq!(item.portable_reference_candidates.len(), 2);
         assert_eq!(
@@ -542,10 +575,7 @@ mod tests {
             IMDB_REFERENCE_NAMESPACE
         );
         assert_eq!(item.portable_reference_candidates[1].value, b"title/tt123");
-        assert_eq!(
-            item.recommended_mapping_roots,
-            vec![item.portable_reference_candidates[0].clone()]
-        );
+        assert!(item.recommended_mapping_roots.is_empty());
         assert_eq!(item.assets.len(), 1);
         assert_eq!(item.assets[0].key, Some(key("asset:poster")));
 
@@ -564,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn retains_all_guid_candidates_but_recommends_only_the_primary() {
+    fn recommends_existing_candidates_for_the_section_policy() {
         let mut episode = episode();
         episode.guids = vec![
             PlexGuid {
@@ -572,6 +602,9 @@ mod tests {
             },
             PlexGuid {
                 id: "tvdb://789".to_owned(),
+            },
+            PlexGuid {
+                id: "imdb://tt123".to_owned(),
             },
             PlexGuid {
                 id: "plex://episode/abc".to_owned(),
@@ -584,16 +617,26 @@ mod tests {
             },
         ];
 
-        let item = provider_item(&episode);
-        assert_eq!(item.portable_reference_candidates.len(), 3);
+        let item = provider_item(&episode, RecommendationPolicy::Movie);
+        assert_eq!(item.portable_reference_candidates.len(), 4);
         assert_eq!(
             item.recommended_mapping_roots,
-            vec![item.portable_reference_candidates[0].clone()]
+            item.portable_reference_candidates[1..].to_vec()
         );
 
-        episode.guid = Some("unknown://primary".to_owned());
-        let item = provider_item(&episode);
-        assert_eq!(item.portable_reference_candidates.len(), 3);
+        let item = provider_item(&episode, RecommendationPolicy::SeriesTmdb);
+        assert_eq!(
+            item.recommended_mapping_roots,
+            vec![item.portable_reference_candidates[1].clone()]
+        );
+
+        let item = provider_item(&episode, RecommendationPolicy::SeriesTvdb);
+        assert_eq!(
+            item.recommended_mapping_roots,
+            vec![item.portable_reference_candidates[2].clone()]
+        );
+
+        let item = provider_item(&episode, RecommendationPolicy::None);
         assert!(item.recommended_mapping_roots.is_empty());
     }
 

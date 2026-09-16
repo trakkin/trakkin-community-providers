@@ -576,6 +576,7 @@ async fn mount_movie_section(server: &MockServer) {
                     "key": "1",
                     "uuid": "movies-1",
                     "title": "Movies",
+                    "agent": "tv.plex.agents.movie",
                     "type": "movie",
                     "updatedAt": 200
                 }]
@@ -651,7 +652,11 @@ async fn streams_an_authenticated_paginated_catalog() {
                         "type": "movie",
                         "title": "First",
                         "year": 2024,
-                        "Guid": [{ "id": "imdb://tt0000010" }]
+                        "Guid": [
+                            { "id": "imdb://tt0000010" },
+                            { "id": "tmdb://10" },
+                            { "id": "tvdb://20" }
+                        ]
                     },
                     {
                         "ratingKey": "20",
@@ -720,11 +725,19 @@ async fn streams_an_authenticated_paginated_catalog() {
         first_batch.item_upserts[0]
             .portable_reference_candidates
             .len(),
-        2
+        4
     );
     assert_eq!(
-        first_batch.item_upserts[0].recommended_mapping_roots.len(),
-        1
+        first_batch.item_upserts[0]
+            .recommended_mapping_roots
+            .iter()
+            .map(|reference| reference.namespace.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            mapping::IMDB_REFERENCE_NAMESPACE,
+            mapping::TMDB_REFERENCE_NAMESPACE,
+            mapping::TVDB_REFERENCE_NAMESPACE,
+        ]
     );
     let Some(read_catalog_response::Event::Batch(second_batch)) = &events[1].event else {
         panic!("second catalog event was not a batch");
@@ -735,6 +748,257 @@ async fn streams_an_authenticated_paginated_catalog() {
         events[2].event,
         Some(read_catalog_response::Event::Completed(_))
     ));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn applies_show_ordering_with_section_fallback_to_catalog_and_lookup() {
+    let server = MockServer::start().await;
+    let adapter = open_adapter(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/library/sections/all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "Directory": [{
+                    "key": "2",
+                    "uuid": "series-2",
+                    "title": "Series",
+                    "agent": "tv.plex.agents.series",
+                    "type": "show",
+                    "updatedAt": 300
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/2/prefs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "Setting": [
+                    { "id": "includeAdult", "value": false },
+                    { "id": "showOrdering", "value": "tmdbAiring" }
+                ]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/2/all"))
+        .and(query_param("includeGuids", "1"))
+        .and(query_param("type", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "size": 2,
+                "offset": 0,
+                "totalSize": 2,
+                "Metadata": [
+                    {
+                        "ratingKey": "50",
+                        "key": "/library/metadata/50",
+                        "guid": "plex://show/default",
+                        "type": "show",
+                        "title": "Section Default",
+                        "showOrdering": null,
+                        "Guid": [
+                            { "id": "imdb://tt0000050" },
+                            { "id": "tmdb://50" },
+                            { "id": "tvdb://150" }
+                        ]
+                    },
+                    {
+                        "ratingKey": "51",
+                        "key": "/library/metadata/51",
+                        "guid": "plex://show/override",
+                        "type": "show",
+                        "title": "Show Override",
+                        "showOrdering": "tvdbDvd",
+                        "Guid": [
+                            { "id": "tmdb://51" },
+                            { "id": "tvdb://151" }
+                        ]
+                    }
+                ]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    for media_type in ["3", "4"] {
+        Mock::given(method("GET"))
+            .and(path("/library/sections/2/all"))
+            .and(query_param("includeGuids", "1"))
+            .and(query_param("type", media_type))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "MediaContainer": { "Metadata": [] }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/library/sections/2/all"))
+        .and(query_param("guid", "tvdb://151"))
+        .and(query_param("includeGuids", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "Metadata": [{
+                    "ratingKey": "51",
+                    "key": "/library/metadata/51",
+                    "guid": "plex://show/override",
+                    "type": "show",
+                    "title": "Show Override",
+                    "showOrdering": "tvdbDvd",
+                    "Guid": [
+                        { "id": "tmdb://51" },
+                        { "id": "tvdb://151" }
+                    ]
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut stream = adapter
+        .read_catalog(Request::new(ReadCatalogRequest {
+            operation_id: b"series-catalog".to_vec(),
+            source_key: Some(mapping::source_key("2")),
+            mode: ReadMode::Full as i32,
+            prior_cursor: Vec::new(),
+            preferred_batch_size: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let first_event = stream.next().await.unwrap().unwrap();
+    let Some(read_catalog_response::Event::Batch(batch)) = first_event.event else {
+        panic!("series catalog did not begin with a batch");
+    };
+    assert_eq!(
+        batch.item_upserts[0]
+            .recommended_mapping_roots
+            .iter()
+            .map(|reference| reference.namespace.as_str())
+            .collect::<Vec<_>>(),
+        vec![mapping::TMDB_REFERENCE_NAMESPACE]
+    );
+    assert_eq!(
+        batch.item_upserts[1]
+            .recommended_mapping_roots
+            .iter()
+            .map(|reference| reference.namespace.as_str())
+            .collect::<Vec<_>>(),
+        vec![mapping::TVDB_REFERENCE_NAMESPACE]
+    );
+    while stream.next().await.is_some() {}
+
+    let response = adapter
+        .lookup_portable_references(Request::new(LookupPortableReferencesRequest {
+            operation_id: b"series-lookup".to_vec(),
+            references: vec![PortableReference {
+                namespace: mapping::TVDB_REFERENCE_NAMESPACE.to_owned(),
+                value: b"series/151".to_vec(),
+            }],
+            source_key: Some(mapping::source_key("2")),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(lookup_portable_references_response::Outcome::Result(result)) = response.outcome
+    else {
+        panic!("series reference lookup failed");
+    };
+    let Some(portable_reference_lookup_result::Outcome::Matched(matched)) =
+        &result.results[0].outcome
+    else {
+        panic!("series reference did not resolve");
+    };
+    let provider_item = matched
+        .candidate
+        .as_ref()
+        .and_then(|candidate| candidate.provider_item.as_ref())
+        .expect("matched series provider item");
+    assert_eq!(
+        provider_item
+            .recommended_mapping_roots
+            .iter()
+            .map(|reference| reference.namespace.as_str())
+            .collect::<Vec<_>>(),
+        vec![mapping::TVDB_REFERENCE_NAMESPACE]
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn does_not_recommend_routes_for_unsupported_agents() {
+    let server = MockServer::start().await;
+    let adapter = open_adapter(&server).await;
+
+    Mock::given(method("GET"))
+        .and(path("/library/sections/all"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "Directory": [{
+                    "key": "3",
+                    "uuid": "legacy-movies-3",
+                    "title": "Legacy Movies",
+                    "agent": "com.plexapp.agents.imdb",
+                    "type": "movie",
+                    "updatedAt": 400
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/3/all"))
+        .and(query_param("includeGuids", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "size": 1,
+                "offset": 0,
+                "totalSize": 1,
+                "Metadata": [{
+                    "ratingKey": "60",
+                    "key": "/library/metadata/60",
+                    "guid": "plex://movie/legacy",
+                    "type": "movie",
+                    "title": "Legacy",
+                    "Guid": [
+                        { "id": "imdb://tt0000060" },
+                        { "id": "tmdb://60" },
+                        { "id": "tvdb://160" }
+                    ]
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut stream = adapter
+        .read_catalog(Request::new(ReadCatalogRequest {
+            operation_id: b"unsupported-agent-catalog".to_vec(),
+            source_key: Some(mapping::source_key("3")),
+            mode: ReadMode::Full as i32,
+            prior_cursor: Vec::new(),
+            preferred_batch_size: 10,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let first_event = stream.next().await.unwrap().unwrap();
+    let Some(read_catalog_response::Event::Batch(batch)) = first_event.event else {
+        panic!("unsupported-agent catalog did not begin with a batch");
+    };
+    assert_eq!(batch.item_upserts[0].portable_reference_candidates.len(), 4);
+    assert!(batch.item_upserts[0].recommended_mapping_roots.is_empty());
+    while stream.next().await.is_some() {}
     server.verify().await;
 }
 

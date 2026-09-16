@@ -63,13 +63,16 @@ use crate::{
     client::{PlexClient, PlexError},
     mapping,
     model::{
-        LibrarySection, LibrarySections, MediaItem, MetadataContainer, Pin as PlexPin, Resource,
-        ServerInfo,
+        LibrarySection, LibrarySections, MediaItem, MetadataContainer, Pin as PlexPin, Preferences,
+        Resource, ServerInfo,
     },
 };
 
 const PLEX_TV_URL: &str = "https://plex.tv";
 const PLEX_LIBRARY_IDENTIFIER: &str = "com.plexapp.plugins.library";
+const PLEX_MOVIE_AGENT: &str = "tv.plex.agents.movie";
+const PLEX_SERIES_AGENT: &str = "tv.plex.agents.series";
+const SHOW_ORDERING_PREFERENCE: &str = "showOrdering";
 const MAX_PAGE_SIZE: usize = 1_000;
 const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_LOOKUP_BATCH: usize = 50;
@@ -96,6 +99,7 @@ struct PlexConnection {
     client: PlexClient,
     server: ServerInfo,
     sections: Arc<RwLock<HashMap<String, LibrarySection>>>,
+    recommendation_policies: Arc<RwLock<HashMap<String, mapping::RecommendationPolicy>>>,
 }
 
 #[derive(Clone)]
@@ -186,14 +190,58 @@ impl PlexAdapter {
             }
             Err(error) => return Err(error),
         };
-        let mut cache = connection.sections.write().await;
-        *cache = sections
-            .directories
-            .iter()
-            .cloned()
-            .map(|section| (section.key.clone(), section))
-            .collect();
+        {
+            let mut cache = connection.sections.write().await;
+            *cache = sections
+                .directories
+                .iter()
+                .cloned()
+                .map(|section| (section.key.clone(), section))
+                .collect();
+        }
+        connection.recommendation_policies.write().await.clear();
         Ok(sections.directories)
+    }
+
+    async fn section_recommendation_policy(
+        connection: &PlexConnection,
+        section: &LibrarySection,
+    ) -> Result<mapping::RecommendationPolicy, PlexError> {
+        if let Some(policy) = connection
+            .recommendation_policies
+            .read()
+            .await
+            .get(&section.key)
+            .copied()
+        {
+            return Ok(policy);
+        }
+
+        let policy = match section.agent.as_deref() {
+            Some(PLEX_MOVIE_AGENT) => mapping::RecommendationPolicy::Movie,
+            Some(PLEX_SERIES_AGENT) => {
+                let preferences = connection
+                    .client
+                    .get_container::<Preferences>(&format!(
+                        "/library/sections/{}/prefs",
+                        section.key
+                    ))
+                    .await?;
+                let show_ordering = preferences
+                    .settings
+                    .iter()
+                    .find(|setting| setting.id == SHOW_ORDERING_PREFERENCE)
+                    .and_then(|setting| setting.value.as_str());
+                series_recommendation_policy(show_ordering)
+            }
+            _ => mapping::RecommendationPolicy::None,
+        };
+        connection
+            .recommendation_policies
+            .write()
+            .await
+            .insert(section.key.clone(), policy);
+        Ok(policy)
     }
 
     async fn open_server(
@@ -722,6 +770,7 @@ impl AdapterService for PlexAdapter {
             client,
             server,
             sections: Arc::new(RwLock::new(HashMap::new())),
+            recommendation_policies: Arc::new(RwLock::new(HashMap::new())),
         };
         *self.connection.write().await = Some(connection);
         let response = OpenConnectionResponse {
@@ -980,6 +1029,25 @@ impl AdapterService for PlexAdapter {
         }
         let connection = self.connection().await?;
         let section = Self::source_section(&connection, request.source_key.as_ref()).await?;
+        let is_series_section = section.agent.as_deref() == Some(PLEX_SERIES_AGENT);
+        let recommendation_policy =
+            match Self::section_recommendation_policy(&connection, &section).await {
+                Ok(policy) => policy,
+                Err(error) => {
+                    let response = LookupPortableReferencesResponse {
+                        outcome: Some(lookup_portable_references_response::Outcome::Error(
+                            plex_failure(
+                                &error,
+                                "section_preferences_failed",
+                                "Plex library mapping preferences could not be read.",
+                            ),
+                        )),
+                    };
+                    validation::lookup_response(&request.references, &response)
+                        .map_err(validation_status)?;
+                    return Ok(Response::new(response));
+                }
+            };
         let path = format!("/library/sections/{}/all", section.key);
         let mut results = Vec::with_capacity(request.references.len());
         for reference in &request.references {
@@ -990,7 +1058,12 @@ impl AdapterService for PlexAdapter {
                     .get_container_with_query::<MetadataContainer>(&path, &query)
                     .await
                 {
-                    Ok(container) => lookup_outcome(reference, container.metadata),
+                    Ok(container) => lookup_outcome(
+                        reference,
+                        container.metadata,
+                        recommendation_policy,
+                        is_series_section,
+                    ),
                     Err(error) => {
                         let response = LookupPortableReferencesResponse {
                             outcome: Some(lookup_portable_references_response::Outcome::Error(
@@ -1185,6 +1258,23 @@ async fn run_catalog(
         .await;
         return;
     }
+    let recommendation_policy =
+        match PlexAdapter::section_recommendation_policy(&connection, &section).await {
+            Ok(policy) => policy,
+            Err(error) => {
+                send_catalog_failed(
+                    sender,
+                    plex_failure(
+                        &error,
+                        "section_preferences_failed",
+                        "Plex library mapping preferences could not be read.",
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+    let is_series_section = section.agent.as_deref() == Some(PLEX_SERIES_AGENT);
     let page_size = (request.preferred_batch_size as usize).clamp(1, MAX_PAGE_SIZE);
     let mut sequence = 0;
     for (path, media_type) in catalog_paths(&section) {
@@ -1225,7 +1315,20 @@ async fn run_catalog(
             if returned == 0 {
                 break;
             }
-            let item_upserts = page.metadata.iter().map(mapping::provider_item).collect();
+            let item_upserts = page
+                .metadata
+                .iter()
+                .map(|item| {
+                    mapping::provider_item(
+                        item,
+                        item_recommendation_policy(
+                            item.show_ordering.as_deref(),
+                            is_series_section,
+                            recommendation_policy,
+                        ),
+                    )
+                })
+                .collect();
             let relation_upserts = page
                 .metadata
                 .iter()
@@ -1611,12 +1714,19 @@ async fn apply_state_writes(
 fn lookup_outcome(
     requested: &PortableReference,
     items: Vec<MediaItem>,
+    section_recommendation_policy: mapping::RecommendationPolicy,
+    is_series_section: bool,
 ) -> portable_reference_lookup_result::Outcome {
     let observed_at = mapping::now_milliseconds();
     let mut candidates = items
         .into_iter()
         .filter_map(|item| {
-            let provider_item = mapping::provider_item(&item);
+            let recommendation_policy = item_recommendation_policy(
+                item.show_ordering.as_deref(),
+                is_series_section,
+                section_recommendation_policy,
+            );
+            let provider_item = mapping::provider_item(&item, recommendation_policy);
             provider_item
                 .portable_reference_candidates
                 .contains(requested)
@@ -1637,6 +1747,29 @@ fn lookup_outcome(
             candidate: candidates.pop(),
         }),
         _ => portable_reference_lookup_result::Outcome::Ambiguous(LookupAmbiguous { candidates }),
+    }
+}
+
+fn item_recommendation_policy(
+    show_ordering: Option<&str>,
+    is_series_section: bool,
+    section_recommendation_policy: mapping::RecommendationPolicy,
+) -> mapping::RecommendationPolicy {
+    if !is_series_section {
+        return section_recommendation_policy;
+    }
+    show_ordering.map_or(section_recommendation_policy, |ordering| {
+        series_recommendation_policy(Some(ordering))
+    })
+}
+
+fn series_recommendation_policy(value: Option<&str>) -> mapping::RecommendationPolicy {
+    match value {
+        Some("tmdbAiring") => mapping::RecommendationPolicy::SeriesTmdb,
+        Some("tvdbAiring" | "tvdbDvd" | "tvdbAbsolute") => {
+            mapping::RecommendationPolicy::SeriesTvdb
+        }
+        _ => mapping::RecommendationPolicy::None,
     }
 }
 
@@ -1937,4 +2070,63 @@ fn plex_status(error: PlexError) -> Status {
     Status::unavailable(
         plex_failure(&error, "plex_request_failed", "The Plex request failed.").safe_message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_supported_series_orderings_conservatively() {
+        assert_eq!(
+            series_recommendation_policy(Some("tmdbAiring")),
+            mapping::RecommendationPolicy::SeriesTmdb
+        );
+        for ordering in ["tvdbAiring", "tvdbDvd", "tvdbAbsolute"] {
+            assert_eq!(
+                series_recommendation_policy(Some(ordering)),
+                mapping::RecommendationPolicy::SeriesTvdb
+            );
+        }
+        assert_eq!(
+            series_recommendation_policy(Some("futureOrdering")),
+            mapping::RecommendationPolicy::None
+        );
+        assert_eq!(
+            series_recommendation_policy(None),
+            mapping::RecommendationPolicy::None
+        );
+    }
+
+    #[test]
+    fn show_ordering_overrides_or_falls_back_to_the_section() {
+        assert_eq!(
+            item_recommendation_policy(None, true, mapping::RecommendationPolicy::SeriesTmdb),
+            mapping::RecommendationPolicy::SeriesTmdb
+        );
+        assert_eq!(
+            item_recommendation_policy(
+                Some("tvdbDvd"),
+                true,
+                mapping::RecommendationPolicy::SeriesTmdb
+            ),
+            mapping::RecommendationPolicy::SeriesTvdb
+        );
+        assert_eq!(
+            item_recommendation_policy(
+                Some("futureOrdering"),
+                true,
+                mapping::RecommendationPolicy::SeriesTmdb
+            ),
+            mapping::RecommendationPolicy::None
+        );
+        assert_eq!(
+            item_recommendation_policy(
+                Some("tvdbDvd"),
+                false,
+                mapping::RecommendationPolicy::Movie
+            ),
+            mapping::RecommendationPolicy::Movie
+        );
+    }
 }

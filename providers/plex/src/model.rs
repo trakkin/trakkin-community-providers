@@ -52,10 +52,27 @@ pub struct LibrarySection {
     #[serde(default)]
     pub uuid: String,
     pub title: String,
+    #[serde(default)]
+    pub agent: Option<String>,
     #[serde(rename = "type")]
     pub media_type: String,
     #[serde(default)]
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preferences {
+    #[serde(rename = "Setting", default)]
+    pub settings: Vec<PreferenceSetting>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreferenceSetting {
+    pub id: String,
+    #[serde(default)]
+    pub value: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -86,6 +103,8 @@ pub struct MediaItem {
     #[serde(rename = "type")]
     pub media_type: String,
     pub title: String,
+    #[serde(default)]
+    pub show_ordering: Option<String>,
     #[serde(default)]
     pub parent_title: Option<String>,
     #[serde(default)]
