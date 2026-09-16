@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "missing required file '$1'"
+}
+
+validate_release() {
+  local metadata="$1"
+  local expected_version="$2"
+  require_file "$metadata"
+
+  local metadata_version
+  metadata_version=$(jq -er '.version | select(type == "string")' "$metadata") \
+    || die "provider metadata has no string version"
+  [[ "$metadata_version" == "$expected_version" ]] \
+    || die "provider version '$metadata_version' does not match release version '$expected_version'"
+}
+
+annotations() {
+  local metadata="$1"
+  local revision="$2"
+  local created_at="$3"
+  require_file "$metadata"
+  [[ -n "$revision" && ! "$revision" =~ [[:space:]] ]] || die "revision is invalid"
+  [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+    || die "created timestamp must be RFC 3339 UTC"
+
+  jq -r --arg revision "$revision" --arg created "$created_at" '
+    def emit($key; $value):
+      if $value == null or $value == "" then empty else "\($key)=\($value)" end;
+    emit("org.opencontainers.image.title"; (.name // .id)),
+    emit("org.opencontainers.image.description"; .description),
+    emit("org.opencontainers.image.version"; .version),
+    emit("org.opencontainers.image.source"; .repo),
+    emit("org.opencontainers.image.url"; .homepage),
+    emit("org.opencontainers.image.documentation"; .documentation),
+    emit("org.opencontainers.image.licenses"; .license),
+    emit("org.opencontainers.image.vendor"; .maintainer.name),
+    emit(
+      "org.opencontainers.image.authors";
+      if .maintainer == null then null
+      else .maintainer.name + (if .maintainer.email then " <\(.maintainer.email)>" else "" end)
+      end
+    ),
+    emit("org.opencontainers.image.revision"; $revision),
+    emit("org.opencontainers.image.created"; $created),
+    (
+      to_entries[]
+      | "dev.trakkin.provider.\(.key)=\(
+          .value
+          | if type == "string" then . else tojson end
+        )"
+    )
+  ' "$metadata"
+}
+
+case "${1:-}" in
+  validate-release)
+    (($# == 3)) || die "usage: package-metadata validate-release <provider.json> <release-version>"
+    validate_release "$2" "$3"
+    ;;
+  annotations)
+    (($# == 4)) || die "usage: package-metadata annotations <provider.json> <revision> <created-at>"
+    annotations "$2" "$3" "$4"
+    ;;
+  *)
+    die "usage: package-metadata <validate-release|annotations> ..."
+    ;;
+esac

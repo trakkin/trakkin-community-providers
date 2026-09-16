@@ -15,8 +15,12 @@ rust = { version = "1.97.1", components = "rustfmt,clippy" }
 [tasks.build]
 description = "Build every community provider"
 run = [
-  { task = "provider:build", args = ["fixture"] },
-  { task = "provider:build", args = ["plex"] },
+  { task = "provider:build", args = [
+    "fixture",
+  ] },
+  { task = "provider:build", args = [
+    "plex",
+  ] },
 ]
 
 [tasks."provider:build"]
@@ -28,7 +32,7 @@ set -euo pipefail
 
 provider="${usage_provider?}"
 [[ "$provider" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]
-[[ -f "providers/$provider/Cargo.toml" ]]
+[[ -f "providers/$provider/Dockerfile" ]]
 
 docker buildx build \
   --target artifact \
@@ -55,7 +59,25 @@ run = [
 
 [tasks."publisher:check"]
 description = "Check the publisher script syntax"
-run = "bash -n scripts/publish"
+run = [
+  "bash -n scripts/publish scripts/package-metadata",
+  '''
+  version=$(jq -er .version providers/fixture/provider.json)
+  bash scripts/package-metadata validate-release providers/fixture/provider.json "$version"
+  if bash scripts/package-metadata validate-release providers/fixture/provider.json 999.999.999 >/dev/null 2>&1; then
+    echo "release version mismatch was accepted" >&2
+    exit 1
+  fi
+
+  annotations=$(bash scripts/package-metadata annotations \
+    providers/fixture/provider.json \
+    0123456789abcdef \
+    2026-09-16T00:00:00Z)
+  printf '%s\n' "$annotations" | grep -Fx 'org.opencontainers.image.title=Fixture'
+  printf '%s\n' "$annotations" | grep -Fx 'org.opencontainers.image.vendor=Trakkin'
+  printf '%s\n' "$annotations" | grep -Fx 'org.opencontainers.image.created=2026-09-16T00:00:00Z'
+  ''',
+]
 
 [tasks."server:start"]
 description = "Start the local OCI registry server and wait until it is healthy"
@@ -75,8 +97,11 @@ description = "Stop the local OCI registry server and delete its artifacts"
 run = "docker compose --file compose.dev.yml down --volumes"
 
 [tasks.test]
-description = "Testing (currently a no-op)"
-run = []
+description = "Run each community provider's own test command"
+run = [
+  "cargo test --locked --manifest-path providers/fixture/Cargo.toml",
+  "cargo test --locked --manifest-path providers/plex/Cargo.toml",
+]
 
 [tasks.update]
 description = "Update the toolchain, workflows, and every provider"

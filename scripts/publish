@@ -41,16 +41,6 @@ normalize_port() {
   printf '%d\n' "$port"
 }
 
-metadata_annotation_lines() {
-  jq -r '
-    to_entries[]
-    | "dev.trakkin.provider.\(.key)=\(
-        .value
-        | if type == "string" then . else tojson end
-      )"
-  ' "$1"
-}
-
 wait_for_server() {
   local port="$1"
   local deadline=$((SECONDS + 10))
@@ -110,10 +100,9 @@ publish_provider() {
 
   jsonschema validate --format-assertion "$SCHEMA_PATH" "$metadata"
 
-  local id version source_url
+  local id version
   id=$(jq -er '.id | select(type == "string")' "$metadata") || die "provider '$provider' has no string id"
   version=$(jq -er '.version | select(type == "string")' "$metadata") || die "provider '$provider' has no string version"
-  source_url=$(jq -er '.repo | select(type == "string")' "$metadata") || die "provider '$provider' has no string repo"
   jq -e --arg platform "$platform" '.platforms | index($platform) != null' "$metadata" >/dev/null \
     || die "provider '$provider' does not support $platform"
 
@@ -134,15 +123,11 @@ publish_provider() {
     || die "provider build produced a non-executable '$artifact_directory/provider'"
   cp -- "$metadata" "$artifact_directory/provider.json"
 
-  local -a annotations=(
-    --annotation "org.opencontainers.image.title=$provider"
-    --annotation "org.opencontainers.image.version=$version"
-    --annotation "org.opencontainers.image.source=$source_url"
-    --annotation "org.opencontainers.image.revision=$commit"
-    --annotation "org.opencontainers.image.created=$created_at"
-  )
+  local -a annotations=()
   local metadata_annotations
-  metadata_annotations=$(metadata_annotation_lines "$metadata")
+  metadata_annotations=$(
+    bash "$ROOT_DIR/scripts/package-metadata" annotations "$metadata" "$commit" "$created_at"
+  )
   local annotation
   while IFS= read -r annotation; do
     annotations+=(--annotation "$annotation")

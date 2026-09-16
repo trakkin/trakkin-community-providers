@@ -38,9 +38,7 @@ jobs:
 
           metadata="providers/$provider/provider.json"
           jsonschema validate --format-assertion schemas/provider-v1.schema.json "$metadata"
-
-          metadata_version=$(jq -r .version "$metadata")
-          [[ "$metadata_version" == "$version" ]]
+          bash scripts/package-metadata validate-release "$metadata" "$version"
 
           platforms=$(jq -cer '.platforms | join(",")' "$metadata")
           matrix=$(
@@ -113,6 +111,7 @@ jobs:
       id-token: write
       packages: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: providers-*
@@ -140,22 +139,12 @@ jobs:
           provider_id=$(jq -er '.id' "$metadata")
           release="$provider_id-v$VERSION"
           refs=()
-          annotations=(
-            --annotation "org.opencontainers.image.title=$PROVIDER"
-            --annotation "org.opencontainers.image.version=$VERSION"
-            --annotation "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY"
-            --annotation "org.opencontainers.image.revision=$GITHUB_SHA"
-          )
+          created_at=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
+          annotations=()
           while IFS= read -r annotation; do
             annotations+=(--annotation "$annotation")
           done < <(
-            jq -r '
-              to_entries[]
-              | "dev.trakkin.provider.\(.key)=\(
-                  .value
-                  | if type == "string" then . else tojson end
-                )"
-            ' "$metadata"
+            bash scripts/package-metadata annotations "$metadata" "$GITHUB_SHA" "$created_at"
           )
           for platform in "${platforms[@]}"; do
             dir="dist/${platform//\//_}"
