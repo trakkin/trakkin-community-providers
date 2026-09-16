@@ -267,6 +267,16 @@ impl PlexAdapter {
                     "Plex server access could not be resolved.",
                 )
             })?;
+        let resource_count = resources.len();
+        let server_resource_count = resources
+            .iter()
+            .filter(|resource| {
+                resource
+                    .provides
+                    .split(',')
+                    .any(|capability| capability == "server")
+            })
+            .count();
         let resource = resources
             .into_iter()
             .find(|resource| {
@@ -277,6 +287,14 @@ impl PlexAdapter {
                         .any(|capability| capability == "server")
             })
             .ok_or_else(|| {
+                tracing::error!(
+                    event = "provider.connection.server_not_found",
+                    provider.code = "connection_server_not_found",
+                    provider.message =
+                        "The signed-in Plex account does not include the configured server.",
+                    account.resource_count = resource_count,
+                    account.server_count = server_resource_count,
+                );
                 operation_failure(
                     OperationFailureCategory::Authorization,
                     "connection_server_not_found",

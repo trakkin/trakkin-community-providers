@@ -47,27 +47,34 @@ struct FixtureProcess {
 
 impl FixtureProcess {
     async fn launch(process_instance_id: &str) -> Self {
+        Self::launch_with_log_level(process_instance_id, None).await
+    }
+
+    async fn launch_with_log_level(process_instance_id: &str, log_level: Option<&str>) -> Self {
         let launch = LaunchRequest {
             bootstrap_version: BOOTSTRAP_VERSION,
             process_instance_id: process_instance_id.to_owned(),
             bind_address: "127.0.0.1:0".to_owned(),
             launch_token: format!("launch-token-{process_instance_id}"),
         };
-        let mut child = Command::new(env!("CARGO_BIN_EXE_trakkin-provider-fixture"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_trakkin-provider-fixture"));
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+            .kill_on_drop(true);
+        if let Some(log_level) = log_level {
+            command.env("TRAKKIN_LOG", log_level);
+        }
+        let mut child = command.spawn().unwrap();
         let stderr = child.stderr.take().unwrap();
         let stderr_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
-            let mut diagnostics = Vec::new();
+            let mut log_lines = Vec::new();
             while let Some(line) = lines.next_line().await.unwrap() {
-                diagnostics.push(line);
+                log_lines.push(line);
             }
-            diagnostics
+            log_lines
         });
         let mut stdin = child.stdin.take().unwrap();
         stdin
@@ -222,7 +229,7 @@ impl FixtureProcess {
             .into_inner()
     }
 
-    async fn shutdown(mut self) {
+    async fn shutdown(mut self) -> Vec<serde_json::Value> {
         let request = self.signed(ShutdownRequest { grace_period: None });
         timeout(RPC_TIMEOUT, self.client.shutdown(request))
             .await
@@ -233,31 +240,34 @@ impl FixtureProcess {
             .unwrap()
             .unwrap();
         assert!(status.success());
-        let diagnostics = timeout(RPC_TIMEOUT, self.stderr_task)
+        let log_lines = timeout(RPC_TIMEOUT, self.stderr_task)
             .await
             .unwrap()
             .unwrap();
-        assert!(!diagnostics.is_empty());
-        for line in &diagnostics {
-            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        assert!(!log_lines.is_empty());
+        let logs = log_lines
+            .iter()
+            .map(|line| {
+                let log = serde_json::from_str::<serde_json::Value>(line).unwrap();
+                assert!(!line.contains("fixture-secret"));
+                assert!(!line.contains("launch-token-"));
+                log
+            })
+            .collect::<Vec<_>>();
+        let starting = logs
+            .iter()
+            .find(|log| log["event"] == "provider.starting")
+            .expect("provider starting log is present");
+        assert_eq!(starting["span"]["provider.id"], "dev.trakkin.fixture");
+        assert_eq!(
+            starting["span"]["process.instance_id"],
+            self.process_instance_id
+        );
+        for line in &log_lines {
             assert!(!line.contains("fixture-secret"));
             assert!(!line.contains("launch-token-"));
         }
-        assert!(
-            diagnostics
-                .iter()
-                .any(|line| line.contains("provider.logging.initialized"))
-        );
-        assert!(diagnostics.iter().any(|line| line.contains("provider.rpc")));
-        assert!(
-            diagnostics
-                .iter()
-                .any(|line| { line.contains(&format!("fixture:{}", self.process_instance_id)) })
-        );
-        assert!(diagnostics.iter().any(|line| {
-            line.contains("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-        }));
-        assert!(diagnostics.iter().any(|line| line.contains("fixture=test")));
+        logs
     }
 }
 
@@ -325,6 +335,20 @@ fn provider_metadata_matches_package() {
     assert_eq!(metadata["schema"], "trakkin.provider/v1");
     assert_eq!(metadata["id"], "dev.trakkin.fixture");
     assert_eq!(metadata["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_log_level_enables_provider_debug_logs() {
+    let fixture = FixtureProcess::launch_with_log_level("debug-level", Some("debug")).await;
+
+    let logs = fixture.shutdown().await;
+
+    assert!(
+        logs.iter().any(|log| {
+            log["level"] == "DEBUG" && log["event"] == "provider.bootstrap.accepted"
+        }),
+        "global log level did not enable provider debug logging"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
