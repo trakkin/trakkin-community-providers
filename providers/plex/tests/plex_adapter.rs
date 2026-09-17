@@ -827,18 +827,51 @@ async fn applies_show_ordering_with_section_fallback_to_catalog_and_lookup() {
         .expect(1)
         .mount(&server)
         .await;
-    for media_type in ["3", "4"] {
-        Mock::given(method("GET"))
-            .and(path("/library/sections/2/all"))
-            .and(query_param("includeGuids", "1"))
-            .and(query_param("type", media_type))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "MediaContainer": { "Metadata": [] }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
+    Mock::given(method("GET"))
+        .and(path("/library/sections/2/all"))
+        .and(query_param("includeGuids", "1"))
+        .and(query_param("type", "3"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "Metadata": [{
+                    "ratingKey": "70",
+                    "key": "/library/metadata/70",
+                    "parentRatingKey": "50",
+                    "guid": "plex://season/default-1",
+                    "type": "season",
+                    "title": "Season 1",
+                    "parentTitle": "Section Default",
+                    "index": 1
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/2/all"))
+        .and(query_param("includeGuids", "1"))
+        .and(query_param("type", "4"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "Metadata": [{
+                    "ratingKey": "80",
+                    "key": "/library/metadata/80",
+                    "parentRatingKey": "70",
+                    "grandparentRatingKey": "50",
+                    "guid": "plex://episode/default-1-1",
+                    "type": "episode",
+                    "title": "Pilot",
+                    "parentTitle": "Season 1",
+                    "grandparentTitle": "Section Default",
+                    "index": 1,
+                    "parentIndex": 1
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/library/sections/2/all"))
         .and(query_param("guid", "tvdb://151"))
@@ -874,8 +907,17 @@ async fn applies_show_ordering_with_section_fallback_to_catalog_and_lookup() {
         .await
         .unwrap()
         .into_inner();
-    let first_event = stream.next().await.unwrap().unwrap();
-    let Some(read_catalog_response::Event::Batch(batch)) = first_event.event else {
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    let mut validator = CatalogStreamValidator::default();
+    for event in &events {
+        validator.accept(event).unwrap();
+    }
+    validator.finish().unwrap();
+    assert_eq!(events.len(), 4);
+    let Some(read_catalog_response::Event::Batch(batch)) = &events[0].event else {
         panic!("series catalog did not begin with a batch");
     };
     assert_eq!(
@@ -894,7 +936,24 @@ async fn applies_show_ordering_with_section_fallback_to_catalog_and_lookup() {
             .collect::<Vec<_>>(),
         vec![mapping::TVDB_REFERENCE_NAMESPACE]
     );
-    while stream.next().await.is_some() {}
+    let Some(read_catalog_response::Event::Batch(season_batch)) = &events[1].event else {
+        panic!("series catalog did not include a season batch");
+    };
+    assert_eq!(
+        season_batch.relation_upserts[0].parent_key,
+        Some(mapping::relation_key("50"))
+    );
+    let Some(read_catalog_response::Event::Batch(episode_batch)) = &events[2].event else {
+        panic!("series catalog did not include an episode batch");
+    };
+    assert_eq!(
+        episode_batch.item_upserts[0].display_name,
+        "Section Default - Season 1 - Pilot"
+    );
+    assert_eq!(
+        episode_batch.relation_upserts[0].parent_key,
+        Some(mapping::relation_key("70"))
+    );
 
     let response = adapter
         .lookup_portable_references(Request::new(LookupPortableReferencesRequest {

@@ -1,5 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
+    error::Error,
+    fmt::Write,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -1980,7 +1982,7 @@ fn unsupported_failure(code: &str) -> OperationFailure {
 }
 
 fn open_connection_failure(error: &PlexError) -> OperationFailure {
-    match error {
+    let failure = match error {
         PlexError::Response(response) if response.status() == Some(StatusCode::UNAUTHORIZED) => {
             operation_failure(
                 OperationFailureCategory::Authentication,
@@ -2009,15 +2011,23 @@ fn open_connection_failure(error: &PlexError) -> OperationFailure {
             "The Plex server could not be reached.",
             true,
         ),
-        _ => plex_failure(
+        _ => classify_plex_failure(
             error,
             "connection_failed",
             "The Plex server could not be opened.",
         ),
-    }
+    };
+    log_plex_failure(error, &failure);
+    failure
 }
 
 fn plex_failure(error: &PlexError, code: &str, safe_message: &str) -> OperationFailure {
+    let failure = classify_plex_failure(error, code, safe_message);
+    log_plex_failure(error, &failure);
+    failure
+}
+
+fn classify_plex_failure(error: &PlexError, code: &str, safe_message: &str) -> OperationFailure {
     let (category, retryable) = match error {
         PlexError::Decode(_) => (OperationFailureCategory::InvalidRemoteData, false),
         _ => match error.status() {
@@ -2037,6 +2047,22 @@ fn plex_failure(error: &PlexError, code: &str, safe_message: &str) -> OperationF
         },
     };
     operation_failure(category, code, safe_message, retryable)
+}
+
+fn log_plex_failure(error: &PlexError, failure: &OperationFailure) {
+    let mut error_chain = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let _ = write!(error_chain, ": {error}");
+        source = error.source();
+    }
+    tracing::error!(
+        event = "provider.operation.failed",
+        provider.code = failure.code,
+        diagnostic.id = failure.diagnostic_id,
+        error = %error,
+        error.chain = %error_chain,
+    );
 }
 
 fn operation_failure(
