@@ -3,11 +3,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use trakkin_provider_sdk::v1::{
-    Attribute, BinaryAssetReference, CatalogRelation, ConfigurationValueKind, DecimalValue, Key,
-    PortableReference, ProviderItem, RatingScale, StateDeletion, StateField, StateFieldDescriptor,
-    StateFieldNumericRange, StateFieldQuantizer, StateObservation, SubjectReference, Term, Value,
-    state_observation, subject_reference, value,
+use trakkin_provider_sdk::{
+    v1::{
+        Attribute, BinaryAssetReference, CatalogRelation, ConfigurationValueKind, DecimalValue,
+        Key, PortableReference, ProviderItem, RatingScale, StateDeletion, StateField,
+        StateFieldDescriptor, StateFieldNumericRange, StateFieldQuantizer, StateObservation,
+        SubjectReference, Term, Value, state_observation, subject_reference, value,
+    },
+    validation,
 };
 
 use crate::model::MediaItem;
@@ -206,10 +209,13 @@ pub fn portable_reference(guid: &str, media_type: &str) -> Option<PortableRefere
         _ if reverse_dns_guid_scheme(&scheme) => (scheme, identifier.to_owned()),
         _ => return None,
     };
-    Some(PortableReference {
+    let reference = PortableReference {
         namespace,
         value: value.as_bytes().to_vec(),
-    })
+    };
+    validation::portable_reference(&reference, "Plex portable reference")
+        .ok()
+        .map(|()| reference)
 }
 
 pub fn plex_guid(reference: &PortableReference) -> Option<String> {
@@ -435,13 +441,33 @@ pub fn asset_kind(asset_key: &Key) -> Option<&str> {
 }
 
 fn display_name(item: &MediaItem) -> String {
-    match (&item.grandparent_title, &item.parent_title) {
-        (Some(grandparent), Some(parent)) if !grandparent.is_empty() && !parent.is_empty() => {
-            format!("{grandparent} - {parent} - {}", item.title)
-        }
-        (_, Some(parent)) if !parent.is_empty() => format!("{parent} - {}", item.title),
-        _ => item.title.clone(),
+    let rating_key = display_part(&item.rating_key).unwrap_or_else(|| "unknown".to_owned());
+    let title =
+        display_part(&item.title).unwrap_or_else(|| format!("Untitled Plex item {rating_key}"));
+    let mut parts = Vec::with_capacity(3);
+    if let Some(grandparent) = item.grandparent_title.as_deref().and_then(display_part) {
+        parts.push(grandparent);
     }
+    if let Some(parent) = item.parent_title.as_deref().and_then(display_part) {
+        parts.push(parent);
+    }
+    parts.push(title);
+    parts.join(" - ")
+}
+
+fn display_part(value: &str) -> Option<String> {
+    let normalized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let normalized = normalized.trim();
+    (!normalized.is_empty()).then(|| normalized.to_owned())
 }
 
 fn asset_reference(kind: &str) -> BinaryAssetReference {
@@ -717,6 +743,27 @@ mod tests {
 
         assert_eq!(reference.namespace, "org.example.agent");
         assert_eq!(reference.value, b"series/123");
+    }
+
+    #[test]
+    fn normalizes_catalog_fields_to_the_provider_contract() {
+        let mut episode = episode();
+        episode.title = "\n\0".to_owned();
+        episode.parent_title = Some(" Season\n1 ".to_owned());
+        episode.grandparent_title = Some("\0".to_owned());
+        episode.guids = vec![PlexGuid {
+            id: format!("org.example.agent://{}", "x".repeat(1_025)),
+        }];
+
+        let item = provider_item(&episode, RecommendationPolicy::None);
+
+        assert_eq!(item.display_name, "Season 1 - Untitled Plex item 42");
+        assert!(!item.display_name.chars().any(char::is_control));
+        assert_eq!(item.portable_reference_candidates.len(), 1);
+        for reference in &item.portable_reference_candidates {
+            validation::portable_reference(reference, "provider item portable reference")
+                .expect("mapped portable references satisfy the provider contract");
+        }
     }
 
     #[test]

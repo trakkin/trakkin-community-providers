@@ -861,11 +861,14 @@ async fn applies_show_ordering_with_section_fallback_to_catalog_and_lookup() {
                     "grandparentRatingKey": "50",
                     "guid": "plex://episode/default-1-1",
                     "type": "episode",
-                    "title": "Pilot",
+                    "title": "\n",
                     "parentTitle": "Season 1",
                     "grandparentTitle": "Section Default",
                     "index": 1,
-                    "parentIndex": 1
+                    "parentIndex": 1,
+                    "Guid": [{
+                        "id": format!("org.example.agent://{}", "x".repeat(1_025))
+                    }]
                 }]
             }
         })))
@@ -948,7 +951,13 @@ async fn applies_show_ordering_with_section_fallback_to_catalog_and_lookup() {
     };
     assert_eq!(
         episode_batch.item_upserts[0].display_name,
-        "Section Default - Season 1 - Pilot"
+        "Section Default - Season 1 - Untitled Plex item 80"
+    );
+    assert_eq!(
+        episode_batch.item_upserts[0]
+            .portable_reference_candidates
+            .len(),
+        1
     );
     assert_eq!(
         episode_batch.relation_upserts[0].parent_key,
