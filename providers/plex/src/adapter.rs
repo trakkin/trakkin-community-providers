@@ -2048,10 +2048,17 @@ fn operation_failure(
 }
 
 fn validation_status(error: impl std::fmt::Display) -> Status {
+    tracing::error!(%error, "provider response validation failed");
     Status::internal(error.to_string())
 }
 
 fn plex_status(error: PlexError) -> Status {
+    tracing::error!(
+        error = %error,
+        source = ?std::error::Error::source(&error),
+        status = ?error.status(),
+        "Plex request failed"
+    );
     Status::unavailable(
         plex_failure(&error, "plex_request_failed", "The Plex request failed.").safe_message,
     )
