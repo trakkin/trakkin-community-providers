@@ -1,7 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    error::Error,
-    fmt::Write,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -317,16 +315,6 @@ impl PlexAdapter {
                     "Plex server access could not be resolved.",
                 )
             })?;
-        let resource_count = resources.len();
-        let server_resource_count = resources
-            .iter()
-            .filter(|resource| {
-                resource
-                    .provides
-                    .split(',')
-                    .any(|capability| capability == "server")
-            })
-            .count();
         let resource = resources
             .into_iter()
             .find(|resource| {
@@ -337,14 +325,6 @@ impl PlexAdapter {
                         .any(|capability| capability == "server")
             })
             .ok_or_else(|| {
-                tracing::error!(
-                    event = "provider.connection.server_not_found",
-                    provider.code = "connection_server_not_found",
-                    provider.message =
-                        "The signed-in Plex account does not include the configured server.",
-                    account.resource_count = resource_count,
-                    account.server_count = server_resource_count,
-                );
                 operation_failure(
                     OperationFailureCategory::Authorization,
                     "connection_server_not_found",
@@ -1982,7 +1962,7 @@ fn unsupported_failure(code: &str) -> OperationFailure {
 }
 
 fn open_connection_failure(error: &PlexError) -> OperationFailure {
-    let failure = match error {
+    match error {
         PlexError::Response(response) if response.status() == Some(StatusCode::UNAUTHORIZED) => {
             operation_failure(
                 OperationFailureCategory::Authentication,
@@ -2016,15 +1996,11 @@ fn open_connection_failure(error: &PlexError) -> OperationFailure {
             "connection_failed",
             "The Plex server could not be opened.",
         ),
-    };
-    log_plex_failure(error, &failure);
-    failure
+    }
 }
 
 fn plex_failure(error: &PlexError, code: &str, safe_message: &str) -> OperationFailure {
-    let failure = classify_plex_failure(error, code, safe_message);
-    log_plex_failure(error, &failure);
-    failure
+    classify_plex_failure(error, code, safe_message)
 }
 
 fn classify_plex_failure(error: &PlexError, code: &str, safe_message: &str) -> OperationFailure {
@@ -2049,22 +2025,6 @@ fn classify_plex_failure(error: &PlexError, code: &str, safe_message: &str) -> O
     operation_failure(category, code, safe_message, retryable)
 }
 
-fn log_plex_failure(error: &PlexError, failure: &OperationFailure) {
-    let mut error_chain = error.to_string();
-    let mut source = error.source();
-    while let Some(error) = source {
-        let _ = write!(error_chain, ": {error}");
-        source = error.source();
-    }
-    tracing::error!(
-        event = "provider.operation.failed",
-        provider.code = failure.code,
-        diagnostic.id = failure.diagnostic_id,
-        error = %error,
-        error.chain = %error_chain,
-    );
-}
-
 fn operation_failure(
     category: OperationFailureCategory,
     code: &str,
@@ -2083,7 +2043,6 @@ fn operation_failure(
             },
             after: None,
         }),
-        diagnostic_id: format!("plex:{}", Uuid::new_v4()),
         ..OperationFailure::default()
     }
 }

@@ -869,7 +869,6 @@ pub(crate) fn operation_failure(
             },
             after: None,
         }),
-        diagnostic_id: format!("fixture:{code}"),
         ..OperationFailure::default()
     }
 }

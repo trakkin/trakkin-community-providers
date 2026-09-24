@@ -3,7 +3,6 @@ use std::{process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    task::JoinHandle,
     time::timeout,
 };
 use tonic::{Code, Request, Streaming, transport::Channel};
@@ -11,13 +10,12 @@ use trakkin_provider_fixture::scenarios::{
     ADVERSARIAL, DUAL_CONNECTION_ISOLATION, EMPTY_TARGETED_RECEIVER,
 };
 use trakkin_provider_sdk::{
-    BOOTSTRAP_VERSION, InvocationContext, LaunchRequest, LaunchToken, ReadyMessage,
-    supported_protocol_range,
+    BOOTSTRAP_VERSION, LaunchRequest, LaunchToken, ReadyMessage, supported_protocol_range,
 };
 use trakkin_provider_sdk::{
     v1::{
         AuthenticationStatus, ConfigurationValue, ContinueAuthenticationRequest, CoordinateBacking,
-        HandshakeRequest, HealthRequest, LookupPortableReferencesRequest, OpenConnectionRequest,
+        HandshakeRequest, LookupPortableReferencesRequest, OpenConnectionRequest,
         OpenConnectionResult, OperationFailure, PortableEndpoint, PortableReference,
         ReadAssetRequest, ReadAssetResponse, ReadCatalogRequest, ReadCatalogResponse, ReadMode,
         ReadStateRequest, ReadStateResponse, ResolvePortableEndpointsRequest, RetryDisposition,
@@ -42,15 +40,10 @@ struct FixtureProcess {
     client: AdapterServiceClient<Channel>,
     launch_token: LaunchToken,
     process_instance_id: String,
-    stderr_task: JoinHandle<Vec<String>>,
 }
 
 impl FixtureProcess {
     async fn launch(process_instance_id: &str) -> Self {
-        Self::launch_with_log_level(process_instance_id, None).await
-    }
-
-    async fn launch_with_log_level(process_instance_id: &str, log_level: Option<&str>) -> Self {
         let launch = LaunchRequest {
             bootstrap_version: BOOTSTRAP_VERSION,
             process_instance_id: process_instance_id.to_owned(),
@@ -61,21 +54,9 @@ impl FixtureProcess {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .kill_on_drop(true);
-        if let Some(log_level) = log_level {
-            command.env("TRAKKIN_LOG", log_level);
-        }
         let mut child = command.spawn().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            let mut log_lines = Vec::new();
-            while let Some(line) = lines.next_line().await.unwrap() {
-                log_lines.push(line);
-            }
-            log_lines
-        });
         let mut stdin = child.stdin.take().unwrap();
         stdin
             .write_all(format!("{}\n", serde_json::to_string(&launch).unwrap()).as_bytes())
@@ -102,20 +83,12 @@ impl FixtureProcess {
             client,
             launch_token: LaunchToken::new(&launch.launch_token).unwrap(),
             process_instance_id: process_instance_id.to_owned(),
-            stderr_task,
         }
     }
 
     fn signed<T>(&self, value: T) -> Request<T> {
         let mut request = Request::new(value);
         self.launch_token.apply(&mut request);
-        InvocationContext::new(
-            &format!("fixture:{}", self.process_instance_id),
-            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
-            Some("fixture=test"),
-        )
-        .unwrap()
-        .apply(&mut request);
         request
     }
 
@@ -229,7 +202,7 @@ impl FixtureProcess {
             .into_inner()
     }
 
-    async fn shutdown(mut self) -> Vec<serde_json::Value> {
+    async fn shutdown(mut self) {
         let request = self.signed(ShutdownRequest { grace_period: None });
         timeout(RPC_TIMEOUT, self.client.shutdown(request))
             .await
@@ -240,34 +213,6 @@ impl FixtureProcess {
             .unwrap()
             .unwrap();
         assert!(status.success());
-        let log_lines = timeout(RPC_TIMEOUT, self.stderr_task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!log_lines.is_empty());
-        let logs = log_lines
-            .iter()
-            .map(|line| {
-                let log = serde_json::from_str::<serde_json::Value>(line).unwrap();
-                assert!(!line.contains("fixture-secret"));
-                assert!(!line.contains("launch-token-"));
-                log
-            })
-            .collect::<Vec<_>>();
-        let starting = logs
-            .iter()
-            .find(|log| log["event"] == "provider.starting")
-            .expect("provider starting log is present");
-        assert_eq!(starting["span"]["provider.id"], "dev.trakkin.fixture");
-        assert_eq!(
-            starting["span"]["process.instance_id"],
-            self.process_instance_id
-        );
-        for line in &log_lines {
-            assert!(!line.contains("fixture-secret"));
-            assert!(!line.contains("launch-token-"));
-        }
-        logs
     }
 }
 
@@ -338,25 +283,13 @@ fn provider_metadata_matches_package() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn global_log_level_enables_provider_debug_logs() {
-    let fixture = FixtureProcess::launch_with_log_level("debug-level", Some("debug")).await;
-
-    let logs = fixture.shutdown().await;
-
-    assert!(
-        logs.iter().any(|log| {
-            log["level"] == "DEBUG" && log["event"] == "provider.bootstrap.accepted"
-        }),
-        "global log level did not enable provider debug logging"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_token_auth_and_empty_receiver_flow_cross_process_boundary() {
     let mut fixture = FixtureProcess::launch("core-flow").await;
     let error = fixture
         .client
-        .health(Request::new(HealthRequest {}))
+        .describe_connection(Request::new(
+            trakkin_provider_sdk::v1::DescribeConnectionRequest {},
+        ))
         .await
         .unwrap_err();
     assert_eq!(error.code(), Code::Unauthenticated);
