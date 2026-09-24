@@ -9,24 +9,35 @@ use trakkin_provider_sdk::{read_launch_request, serve_adapter};
 async fn main() -> ExitCode {
     initialize_logging();
     match run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            error!(error = ?error, "provider stopped with an error");
-            ExitCode::FAILURE
+        Ok(()) => {
+            info!("provider stopped");
+            ExitCode::SUCCESS
         }
+        Err(_) => ExitCode::FAILURE,
     }
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let launch = read_launch_request(io::stdin().lock())?;
+    let launch = match read_launch_request(io::stdin().lock()) {
+        Ok(launch) => launch,
+        Err(error) => {
+            error!(provider.stage = "bootstrap", "provider failed to start");
+            return Err(error.into());
+        }
+    };
     info!(
         process_instance_id = %launch.process_instance_id,
         "starting provider"
     );
     let adapter = PlexAdapter::new(launch.process_instance_id.clone(), Default::default());
     let shutdown = adapter.shutdown_token().cancelled_owned();
-    serve_adapter(&launch, adapter, io::stdout(), shutdown).await?;
-    Ok(())
+    match serve_adapter(&launch, adapter, io::stdout(), shutdown).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            error!(provider.stage = "serve", "provider stopped with an error");
+            Err(error.into())
+        }
+    }
 }
 
 fn initialize_logging() {

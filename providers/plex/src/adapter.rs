@@ -579,6 +579,21 @@ impl AdapterService for PlexAdapter {
             outcome: Some(outcome),
         };
         validation::start_authentication_response(&response).map_err(validation_status)?;
+        match response
+            .outcome
+            .as_ref()
+            .expect("validated authentication outcome")
+        {
+            start_authentication_response::Outcome::Result(progress) => tracing::info!(
+                authentication.status = ?AuthenticationStatus::try_from(progress.status),
+                "Plex authentication started"
+            ),
+            start_authentication_response::Outcome::Error(failure) => tracing::warn!(
+                failure.code = %failure.code,
+                failure.category = ?OperationFailureCategory::try_from(failure.category),
+                "Plex authentication could not be started"
+            ),
+        }
         Ok(Response::new(response))
     }
 
@@ -675,6 +690,24 @@ impl AdapterService for PlexAdapter {
             outcome: Some(outcome),
         };
         validation::continue_authentication_response(&response).map_err(validation_status)?;
+        match response
+            .outcome
+            .as_ref()
+            .expect("validated authentication outcome")
+        {
+            continue_authentication_response::Outcome::Result(progress)
+                if !matches!(
+                    AuthenticationStatus::try_from(progress.status),
+                    Ok(AuthenticationStatus::Waiting | AuthenticationStatus::InputRequired)
+                ) =>
+            {
+                tracing::info!(
+                    authentication.status = ?AuthenticationStatus::try_from(progress.status),
+                    "Plex authentication finished"
+                );
+            }
+            _ => {}
+        }
         Ok(Response::new(response))
     }
 
@@ -703,6 +736,20 @@ impl AdapterService for PlexAdapter {
             outcome: Some(outcome),
         };
         validation::cancel_authentication_response(&response).map_err(validation_status)?;
+        match response
+            .outcome
+            .as_ref()
+            .expect("validated authentication outcome")
+        {
+            cancel_authentication_response::Outcome::Result(_) => {
+                tracing::info!("Plex authentication cancelled");
+            }
+            cancel_authentication_response::Outcome::Error(failure) => tracing::warn!(
+                failure.code = %failure.code,
+                failure.category = ?OperationFailureCategory::try_from(failure.category),
+                "Plex authentication cancellation failed"
+            ),
+        }
         Ok(Response::new(response))
     }
 
@@ -714,6 +761,10 @@ impl AdapterService for PlexAdapter {
         let settings = match settings_from(&request.settings, &request.secrets) {
             Ok(settings) => settings,
             Err(field_problems) => {
+                tracing::warn!(
+                    problem_count = field_problems.len(),
+                    "Plex connection settings were rejected"
+                );
                 let response = OpenConnectionResponse {
                     outcome: Some(open_connection_response::Outcome::Error(OperationFailure {
                         field_problems,
@@ -732,6 +783,11 @@ impl AdapterService for PlexAdapter {
         let (client, server, secret_patches) = match self.open_server(&settings).await {
             Ok(opened) => opened,
             Err(failure) => {
+                tracing::warn!(
+                    failure.code = %failure.code,
+                    failure.category = ?OperationFailureCategory::try_from(failure.category),
+                    "Plex connection could not be opened"
+                );
                 let response = OpenConnectionResponse {
                     outcome: Some(open_connection_response::Outcome::Error(failure)),
                 };
@@ -773,6 +829,7 @@ impl AdapterService for PlexAdapter {
             )),
         };
         validation::open_connection_response(&response).map_err(validation_status)?;
+        tracing::info!(account_count = 1, "Plex connection opened");
         Ok(Response::new(response))
     }
 
@@ -803,6 +860,21 @@ impl AdapterService for PlexAdapter {
             &response,
         )
         .map_err(validation_status)?;
+        match response
+            .outcome
+            .as_ref()
+            .expect("validated discovery outcome")
+        {
+            discover_sources_response::Outcome::Result(result) => tracing::info!(
+                source_count = result.sources.len(),
+                "Plex sources discovered"
+            ),
+            discover_sources_response::Outcome::Error(failure) => tracing::warn!(
+                failure.code = %failure.code,
+                failure.category = ?OperationFailureCategory::try_from(failure.category),
+                "Plex source discovery failed"
+            ),
+        }
         Ok(Response::new(response))
     }
 
@@ -922,6 +994,7 @@ impl AdapterService for PlexAdapter {
         request: Request<WriteTargetedStateRequest>,
     ) -> Result<Response<WriteTargetedStateResponse>, Status> {
         let request = request.into_inner();
+        let intent_count = request.intents.len();
         let capability = targeted_write_capability();
         validation::targeted_state_write_request(&request, &capability)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
@@ -995,6 +1068,25 @@ impl AdapterService for PlexAdapter {
         };
         validation::targeted_state_write_response(&request, &capability, &response)
             .map_err(validation_status)?;
+        if TargetedStateWriteStatus::try_from(response.status)
+            == Ok(TargetedStateWriteStatus::Applied)
+        {
+            tracing::debug!(intent_count, "Plex targeted state write applied");
+        } else {
+            tracing::warn!(
+                intent_count,
+                write.status = ?TargetedStateWriteStatus::try_from(response.status),
+                failure.code = response
+                    .error
+                    .as_ref()
+                    .map(|failure| failure.code.as_str())
+                    .unwrap_or_default(),
+                failure.category = ?response.error.as_ref().and_then(|failure| {
+                    OperationFailureCategory::try_from(failure.category).ok()
+                }),
+                "Plex targeted state write is indeterminate"
+            );
+        }
         Ok(Response::new(response))
     }
 
@@ -1294,6 +1386,19 @@ async fn run_catalog(
                 }
             };
             let returned = page.metadata.len();
+            let Some(next) = next_page_offset(start, page.offset, returned, page.total_size) else {
+                send_catalog_failed(
+                    sender,
+                    operation_failure(
+                        OperationFailureCategory::InvalidRemoteData,
+                        "catalog_pagination_invalid",
+                        "Plex returned invalid catalog pagination.",
+                        false,
+                    ),
+                )
+                .await;
+                return;
+            };
             if returned == 0 {
                 break;
             }
@@ -1315,7 +1420,7 @@ async fn run_catalog(
                 .metadata
                 .iter()
                 .enumerate()
-                .map(|(position, item)| mapping::catalog_relation(item, start + position))
+                .map(|(position, item)| mapping::catalog_relation(item, page.offset + position))
                 .collect();
             let event = ReadCatalogResponse {
                 event: Some(read_catalog_response::Event::Batch(CatalogBatch {
@@ -1332,9 +1437,7 @@ async fn run_catalog(
                 return;
             }
             sequence += 1;
-            let next = page.offset.saturating_add(returned);
             if page.total_size.is_some_and(|total| next >= total)
-                || next <= start
                 || (page.total_size.is_none() && returned < page_size)
             {
                 break;
@@ -1343,15 +1446,27 @@ async fn run_catalog(
         }
     }
     let revision = source_revision(&connection, &section);
-    let _ = sender
-        .send(Ok(ReadCatalogResponse {
+    if send_catalog_event(
+        sender,
+        &cancellation,
+        ReadCatalogResponse {
             event: Some(read_catalog_response::Event::Completed(ReadCompleted {
                 next_cursor: revision.clone(),
                 evidence_revision: revision,
                 observed_time_milliseconds: mapping::now_milliseconds(),
             })),
-        }))
-        .await;
+        },
+    )
+    .await
+    .is_ok()
+    {
+        tracing::info!(
+            stream.kind = "catalog",
+            outcome = "completed",
+            batch_count = sequence,
+            "Plex read completed"
+        );
+    }
 }
 
 async fn run_state(
@@ -1403,6 +1518,19 @@ async fn run_state(
                 }
             };
             let returned = page.metadata.len();
+            let Some(next) = next_page_offset(start, page.offset, returned, page.total_size) else {
+                send_state_failed(
+                    sender,
+                    operation_failure(
+                        OperationFailureCategory::InvalidRemoteData,
+                        "state_pagination_invalid",
+                        "Plex returned invalid state pagination.",
+                        false,
+                    ),
+                )
+                .await;
+                return;
+            };
             if returned == 0 {
                 break;
             }
@@ -1424,9 +1552,7 @@ async fn run_state(
                 return;
             }
             sequence += 1;
-            let next = page.offset.saturating_add(returned);
             if page.total_size.is_some_and(|total| next >= total)
-                || next <= start
                 || (page.total_size.is_none() && returned < page_size)
             {
                 break;
@@ -1435,15 +1561,43 @@ async fn run_state(
         }
     }
     let revision = source_revision(&connection, &section);
-    let _ = sender
-        .send(Ok(ReadStateResponse {
+    if send_state_event(
+        sender,
+        &cancellation,
+        ReadStateResponse {
             event: Some(read_state_response::Event::Completed(ReadCompleted {
                 next_cursor: revision.clone(),
                 evidence_revision: revision,
                 observed_time_milliseconds: observed_at,
             })),
-        }))
-        .await;
+        },
+    )
+    .await
+    .is_ok()
+    {
+        tracing::info!(
+            stream.kind = "state",
+            outcome = "completed",
+            batch_count = sequence,
+            "Plex read completed"
+        );
+    }
+}
+
+fn next_page_offset(
+    requested_offset: usize,
+    response_offset: usize,
+    returned: usize,
+    total: Option<usize>,
+) -> Option<usize> {
+    if response_offset != requested_offset {
+        return None;
+    }
+    let next = response_offset.checked_add(returned)?;
+    if total.is_some_and(|total| next > total || (returned == 0 && requested_offset < total)) {
+        return None;
+    }
+    Some(next)
 }
 
 async fn send_catalog_event(
@@ -1452,6 +1606,7 @@ async fn send_catalog_event(
     event: ReadCatalogResponse,
 ) -> Result<(), ()> {
     tokio::select! {
+        biased;
         _ = cancellation.cancelled() => {
             send_catalog_cancelled(sender).await;
             Err(())
@@ -1466,6 +1621,7 @@ async fn send_state_event(
     event: ReadStateResponse,
 ) -> Result<(), ()> {
     tokio::select! {
+        biased;
         _ = cancellation.cancelled() => {
             send_state_cancelled(sender).await;
             Err(())
@@ -1478,6 +1634,13 @@ async fn send_catalog_failed(
     sender: &mpsc::Sender<Result<ReadCatalogResponse, Status>>,
     error: OperationFailure,
 ) {
+    tracing::warn!(
+        stream.kind = "catalog",
+        outcome = "failed",
+        failure.code = %error.code,
+        failure.category = ?OperationFailureCategory::try_from(error.category),
+        "Plex read failed"
+    );
     let _ = sender
         .send(Ok(ReadCatalogResponse {
             event: Some(read_catalog_response::Event::Failed(ReadFailed {
@@ -1491,6 +1654,13 @@ async fn send_state_failed(
     sender: &mpsc::Sender<Result<ReadStateResponse, Status>>,
     error: OperationFailure,
 ) {
+    tracing::warn!(
+        stream.kind = "state",
+        outcome = "failed",
+        failure.code = %error.code,
+        failure.category = ?OperationFailureCategory::try_from(error.category),
+        "Plex read failed"
+    );
     let _ = sender
         .send(Ok(ReadStateResponse {
             event: Some(read_state_response::Event::Failed(ReadFailed {
@@ -1501,6 +1671,11 @@ async fn send_state_failed(
 }
 
 async fn send_catalog_cancelled(sender: &mpsc::Sender<Result<ReadCatalogResponse, Status>>) {
+    tracing::info!(
+        stream.kind = "catalog",
+        outcome = "cancelled",
+        "Plex read cancelled"
+    );
     let _ = sender
         .send(Ok(ReadCatalogResponse {
             event: Some(read_catalog_response::Event::Cancelled(ReadCancelled {})),
@@ -1509,6 +1684,11 @@ async fn send_catalog_cancelled(sender: &mpsc::Sender<Result<ReadCatalogResponse
 }
 
 async fn send_state_cancelled(sender: &mpsc::Sender<Result<ReadStateResponse, Status>>) {
+    tracing::info!(
+        stream.kind = "state",
+        outcome = "cancelled",
+        "Plex read cancelled"
+    );
     let _ = sender
         .send(Ok(ReadStateResponse {
             event: Some(read_state_response::Event::Cancelled(ReadCancelled {})),
@@ -2048,15 +2228,17 @@ fn operation_failure(
 }
 
 fn validation_status(error: impl std::fmt::Display) -> Status {
-    tracing::error!(%error, "provider response validation failed");
+    tracing::error!(
+        provider.stage = "response_validation",
+        "provider response validation failed"
+    );
     Status::internal(error.to_string())
 }
 
 fn plex_status(error: PlexError) -> Status {
-    tracing::error!(
-        error = %error,
-        source = ?std::error::Error::source(&error),
-        status = ?error.status(),
+    tracing::warn!(
+        provider.stage = "plex_request",
+        http.status_code = ?error.status().map(|status| status.as_u16()),
         "Plex request failed"
     );
     Status::unavailable(
@@ -2067,6 +2249,98 @@ fn plex_status(error: PlexError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_terminal_send_prefers_cancellation_after_backpressure() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(ReadCatalogResponse::default()))
+            .await
+            .expect("buffer catalog event");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let send = tokio::spawn(async move {
+            send_catalog_event(
+                &sender,
+                &cancellation,
+                ReadCatalogResponse {
+                    event: Some(read_catalog_response::Event::Completed(
+                        ReadCompleted::default(),
+                    )),
+                },
+            )
+            .await
+        });
+
+        receiver
+            .recv()
+            .await
+            .expect("buffered catalog event")
+            .expect("valid buffered catalog event");
+        assert_eq!(send.await.expect("catalog sender task"), Err(()));
+        let terminal = receiver
+            .recv()
+            .await
+            .expect("catalog terminal event")
+            .expect("valid catalog terminal event");
+        assert!(matches!(
+            terminal.event,
+            Some(read_catalog_response::Event::Cancelled(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn state_terminal_send_prefers_cancellation_after_backpressure() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(ReadStateResponse::default()))
+            .await
+            .expect("buffer state event");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let send = tokio::spawn(async move {
+            send_state_event(
+                &sender,
+                &cancellation,
+                ReadStateResponse {
+                    event: Some(read_state_response::Event::Completed(
+                        ReadCompleted::default(),
+                    )),
+                },
+            )
+            .await
+        });
+
+        receiver
+            .recv()
+            .await
+            .expect("buffered state event")
+            .expect("valid buffered state event");
+        assert_eq!(send.await.expect("state sender task"), Err(()));
+        let terminal = receiver
+            .recv()
+            .await
+            .expect("state terminal event")
+            .expect("valid state terminal event");
+        assert!(matches!(
+            terminal.event,
+            Some(read_state_response::Event::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn pagination_requires_consistent_offsets_and_totals() {
+        assert_eq!(next_page_offset(0, 0, 2, Some(3)), Some(2));
+        assert_eq!(next_page_offset(2, 2, 1, Some(3)), Some(3));
+        assert_eq!(next_page_offset(3, 3, 0, Some(3)), Some(3));
+        assert_eq!(next_page_offset(2, 2, 0, None), Some(2));
+
+        assert_eq!(next_page_offset(2, 3, 1, Some(4)), None);
+        assert_eq!(next_page_offset(2, 1, 1, Some(4)), None);
+        assert_eq!(next_page_offset(2, 2, 0, Some(3)), None);
+        assert_eq!(next_page_offset(2, 2, 2, Some(3)), None);
+        assert_eq!(next_page_offset(usize::MAX, usize::MAX, 1, None), None);
+    }
 
     #[test]
     fn maps_supported_series_orderings_conservatively() {

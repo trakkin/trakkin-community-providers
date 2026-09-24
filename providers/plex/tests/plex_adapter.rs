@@ -7,12 +7,13 @@ use trakkin_provider_sdk::{
         AuthenticationStatus, ConfigurationValue, ContinueAuthenticationRequest,
         DescribeConnectionRequest, DiscoverSourcesRequest, LookupPortableReferencesRequest,
         OpenConnectionRequest, OperationFailureCategory, PortableReference, ReadCatalogRequest,
-        ReadMode, SecretValue, SourceMembership, StartAuthenticationRequest, SubjectReference,
-        TargetedStateWriteIntent, TargetedStateWriteStatus, ValidateConnectionRequest, Value,
-        WriteTargetedStateRequest, adapter_service_server::AdapterService,
-        continue_authentication_response, describe_connection_response, discover_sources_response,
+        ReadMode, ReadStateRequest, SecretValue, SourceMembership, StartAuthenticationRequest,
+        SubjectReference, TargetedStateWriteIntent, TargetedStateWriteStatus,
+        ValidateConnectionRequest, Value, WriteTargetedStateRequest,
+        adapter_service_server::AdapterService, continue_authentication_response,
+        describe_connection_response, discover_sources_response,
         lookup_portable_references_response, open_connection_response,
-        portable_reference_lookup_result, read_catalog_response, secret_patch,
+        portable_reference_lookup_result, read_catalog_response, read_state_response, secret_patch,
         start_authentication_response, subject_reference, targeted_state_write_intent,
         validate_connection_response, value,
     },
@@ -585,6 +586,145 @@ async fn mount_movie_section(server: &MockServer) {
         .expect(1)
         .mount(server)
         .await;
+}
+
+async fn mount_nonadvancing_movie_pages(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/library/sections/1/all"))
+        .and(query_param("includeGuids", "1"))
+        .and(header("x-plex-container-start", "0"))
+        .and(header("x-plex-container-size", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "size": 2,
+                "offset": 0,
+                "totalSize": 3,
+                "Metadata": [
+                    {
+                        "ratingKey": "10",
+                        "key": "/library/metadata/10",
+                        "guid": "plex://movie/first",
+                        "type": "movie",
+                        "title": "First"
+                    },
+                    {
+                        "ratingKey": "20",
+                        "key": "/library/metadata/20",
+                        "guid": "plex://movie/second",
+                        "type": "movie",
+                        "title": "Second"
+                    }
+                ]
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/1/all"))
+        .and(query_param("includeGuids", "1"))
+        .and(header("x-plex-container-start", "2"))
+        .and(header("x-plex-container-size", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "MediaContainer": {
+                "size": 1,
+                "offset": 0,
+                "totalSize": 3,
+                "Metadata": [{
+                    "ratingKey": "30",
+                    "key": "/library/metadata/30",
+                    "guid": "plex://movie/third",
+                    "type": "movie",
+                    "title": "Third"
+                }]
+            }
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn rejects_a_nonadvancing_catalog_page() {
+    let server = MockServer::start().await;
+    let adapter = open_adapter(&server).await;
+    mount_movie_section(&server).await;
+    mount_nonadvancing_movie_pages(&server).await;
+
+    let mut stream = adapter
+        .read_catalog(Request::new(ReadCatalogRequest {
+            operation_id: b"catalog-pagination-test".to_vec(),
+            source_key: Some(mapping::source_key("1")),
+            mode: ReadMode::Full as i32,
+            prior_cursor: Vec::new(),
+            preferred_batch_size: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert!(!events.iter().any(|event| matches!(
+        event.event,
+        Some(read_catalog_response::Event::Completed(_))
+    )));
+    let Some(read_catalog_response::Event::Failed(failed)) = &events
+        .last()
+        .expect("catalog stream has a terminal event")
+        .event
+    else {
+        panic!("catalog stream did not end in failure");
+    };
+    assert_eq!(
+        failed.error.as_ref().expect("catalog failure").code,
+        "catalog_pagination_invalid"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn rejects_a_nonadvancing_state_page() {
+    let server = MockServer::start().await;
+    let adapter = open_adapter(&server).await;
+    mount_movie_section(&server).await;
+    mount_nonadvancing_movie_pages(&server).await;
+
+    let mut stream = adapter
+        .read_state(Request::new(ReadStateRequest {
+            operation_id: b"state-pagination-test".to_vec(),
+            source_key: Some(mapping::source_key("1")),
+            mode: ReadMode::Full as i32,
+            prior_cursor: Vec::new(),
+            preferred_batch_size: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, Some(read_state_response::Event::Completed(_))))
+    );
+    let Some(read_state_response::Event::Failed(failed)) = &events
+        .last()
+        .expect("state stream has a terminal event")
+        .event
+    else {
+        panic!("state stream did not end in failure");
+    };
+    assert_eq!(
+        failed.error.as_ref().expect("state failure").code,
+        "state_pagination_invalid"
+    );
+    server.verify().await;
 }
 
 #[tokio::test]

@@ -37,7 +37,7 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 url = "2.5.8"
 uuid = { version = "1.20.0", features = ["v4"] }
-trakkin-provider-sdk = { git = "https://github.com/trakkin/trakkin-contracts.git", rev = "1344badcf31565ce9471673b059909050a7d6155", version = "0.0.0" }
+trakkin-provider-sdk = { git = "https://github.com/trakkin/trakkin-contracts.git", rev = "0c645313e5889782ecda60e04ad7e39af5c5dc7b", version = "0.0.0" }
 
 [dev-dependencies]
 wiremock = "0.6.5"

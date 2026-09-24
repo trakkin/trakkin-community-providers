@@ -1,8 +1,9 @@
 use std::{process::Stdio, time::Duration};
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
+    task::JoinHandle,
     time::timeout,
 };
 use tonic::{Code, Request, Streaming, transport::Channel};
@@ -40,6 +41,9 @@ struct FixtureProcess {
     client: AdapterServiceClient<Channel>,
     launch_token: LaunchToken,
     process_instance_id: String,
+    stdout_task: JoinHandle<Vec<u8>>,
+    stderr_task: JoinHandle<String>,
+    sensitive_values: Vec<String>,
 }
 
 impl FixtureProcess {
@@ -54,7 +58,7 @@ impl FixtureProcess {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
@@ -75,6 +79,18 @@ impl FixtureProcess {
         assert_eq!(ready.process_instance_id, process_instance_id);
         assert_eq!(ready.launch_token, launch.launch_token);
 
+        let stdout_task = tokio::spawn(async move {
+            let mut trailing = Vec::new();
+            stdout.read_to_end(&mut trailing).await.unwrap();
+            trailing
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_task = tokio::spawn(async move {
+            let mut diagnostics = String::new();
+            stderr.read_to_string(&mut diagnostics).await.unwrap();
+            diagnostics
+        });
+
         let client = AdapterServiceClient::connect(format!("http://{}", ready.address))
             .await
             .unwrap();
@@ -83,6 +99,9 @@ impl FixtureProcess {
             client,
             launch_token: LaunchToken::new(&launch.launch_token).unwrap(),
             process_instance_id: process_instance_id.to_owned(),
+            stdout_task,
+            stderr_task,
+            sensitive_values: vec![launch.launch_token],
         }
     }
 
@@ -116,6 +135,7 @@ impl FixtureProcess {
         instance: &str,
         secret: &str,
     ) -> Result<OpenConnectionResult, OperationFailure> {
+        self.sensitive_values.push(secret.to_owned());
         let request = self.signed(OpenConnectionRequest {
             settings: [
                 ("scenario", scenario),
@@ -213,6 +233,24 @@ impl FixtureProcess {
             .unwrap()
             .unwrap();
         assert!(status.success());
+        let trailing_stdout = timeout(RPC_TIMEOUT, self.stdout_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            trailing_stdout.is_empty(),
+            "provider wrote non-protocol stdout"
+        );
+        let diagnostics = timeout(RPC_TIMEOUT, self.stderr_task)
+            .await
+            .unwrap()
+            .unwrap();
+        for sensitive_value in self.sensitive_values {
+            assert!(
+                !diagnostics.contains(&sensitive_value),
+                "provider stderr contained a sensitive value"
+            );
+        }
     }
 }
 
