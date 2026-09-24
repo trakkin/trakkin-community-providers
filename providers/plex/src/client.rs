@@ -250,11 +250,11 @@ pub enum PlexError {
     InvalidPath,
     #[error("Plex returned an invalid public asset URL")]
     InvalidAssetUrl,
-    #[error("Plex request failed")]
+    #[error("Plex request failed: {0}")]
     Transport(#[source] reqwest::Error),
-    #[error("Plex returned HTTP {0}")]
+    #[error("Plex returned an unsuccessful response: {0}")]
     Response(#[source] reqwest::Error),
-    #[error("Plex returned an invalid response")]
+    #[error("Plex returned an invalid response: {0}")]
     Decode(#[source] reqwest::Error),
     #[error("Plex asset exceeds the requested size limit")]
     AssetTooLarge,

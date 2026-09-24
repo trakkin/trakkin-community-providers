@@ -373,7 +373,7 @@ impl PlexAdapter {
         }
         Self::load_sections(connection)
             .await
-            .map_err(plex_status)?
+            .map_err(|error| plex_status(error, "source_refresh"))?
             .into_iter()
             .find(|section| section.key == section_key)
             .ok_or_else(|| Status::not_found("source is unknown"))
@@ -540,7 +540,7 @@ impl AdapterService for PlexAdapter {
                 None,
                 self.client_identifier.to_string(),
             )
-            .map_err(plex_status)?;
+            .map_err(|error| plex_status(error, "authentication_start"))?;
             let pin = cloud
                 .request_json::<PlexPin>(Method::POST, "/api/v2/pins", &[("strong", "true")])
                 .await;
@@ -585,12 +585,12 @@ impl AdapterService for PlexAdapter {
             .expect("validated authentication outcome")
         {
             start_authentication_response::Outcome::Result(progress) => tracing::info!(
-                authentication.status = ?AuthenticationStatus::try_from(progress.status),
+                authentication.status = %authentication_status_name(progress.status),
                 "Plex authentication started"
             ),
             start_authentication_response::Outcome::Error(failure) => tracing::warn!(
                 failure.code = %failure.code,
-                failure.category = ?OperationFailureCategory::try_from(failure.category),
+                failure.category = %operation_failure_category_name(failure.category),
                 "Plex authentication could not be started"
             ),
         }
@@ -629,7 +629,7 @@ impl AdapterService for PlexAdapter {
                     None,
                     self.client_identifier.to_string(),
                 )
-                .map_err(plex_status)?;
+                .map_err(|error| plex_status(error, "authentication_continue"))?;
                 match cloud
                     .get_json::<PlexPin>(&format!("/api/v2/pins/{}", pending.pin_id))
                     .await
@@ -702,7 +702,7 @@ impl AdapterService for PlexAdapter {
                 ) =>
             {
                 tracing::info!(
-                    authentication.status = ?AuthenticationStatus::try_from(progress.status),
+                    authentication.status = %authentication_status_name(progress.status),
                     "Plex authentication finished"
                 );
             }
@@ -746,7 +746,7 @@ impl AdapterService for PlexAdapter {
             }
             cancel_authentication_response::Outcome::Error(failure) => tracing::warn!(
                 failure.code = %failure.code,
-                failure.category = ?OperationFailureCategory::try_from(failure.category),
+                failure.category = %operation_failure_category_name(failure.category),
                 "Plex authentication cancellation failed"
             ),
         }
@@ -785,7 +785,7 @@ impl AdapterService for PlexAdapter {
             Err(failure) => {
                 tracing::warn!(
                     failure.code = %failure.code,
-                    failure.category = ?OperationFailureCategory::try_from(failure.category),
+                    failure.category = %operation_failure_category_name(failure.category),
                     "Plex connection could not be opened"
                 );
                 let response = OpenConnectionResponse {
@@ -871,7 +871,7 @@ impl AdapterService for PlexAdapter {
             ),
             discover_sources_response::Outcome::Error(failure) => tracing::warn!(
                 failure.code = %failure.code,
-                failure.category = ?OperationFailureCategory::try_from(failure.category),
+                failure.category = %operation_failure_category_name(failure.category),
                 "Plex source discovery failed"
             ),
         }
@@ -1075,15 +1075,17 @@ impl AdapterService for PlexAdapter {
         } else {
             tracing::warn!(
                 intent_count,
-                write.status = ?TargetedStateWriteStatus::try_from(response.status),
+                write.status = %targeted_state_write_status_name(response.status),
                 failure.code = response
                     .error
                     .as_ref()
                     .map(|failure| failure.code.as_str())
                     .unwrap_or_default(),
-                failure.category = ?response.error.as_ref().and_then(|failure| {
-                    OperationFailureCategory::try_from(failure.category).ok()
-                }),
+                failure.category = response
+                    .error
+                    .as_ref()
+                    .map(|failure| operation_failure_category_name(failure.category))
+                    .unwrap_or("none"),
                 "Plex targeted state write is indeterminate"
             );
         }
@@ -1638,7 +1640,7 @@ async fn send_catalog_failed(
         stream.kind = "catalog",
         outcome = "failed",
         failure.code = %error.code,
-        failure.category = ?OperationFailureCategory::try_from(error.category),
+        failure.category = %operation_failure_category_name(error.category),
         "Plex read failed"
     );
     let _ = sender
@@ -1658,7 +1660,7 @@ async fn send_state_failed(
         stream.kind = "state",
         outcome = "failed",
         failure.code = %error.code,
-        failure.category = ?OperationFailureCategory::try_from(error.category),
+        failure.category = %operation_failure_category_name(error.category),
         "Plex read failed"
     );
     let _ = sender
@@ -2227,6 +2229,18 @@ fn operation_failure(
     }
 }
 
+fn authentication_status_name(value: i32) -> &'static str {
+    AuthenticationStatus::try_from(value).map_or("UNKNOWN", |status| status.as_str_name())
+}
+
+fn operation_failure_category_name(value: i32) -> &'static str {
+    OperationFailureCategory::try_from(value).map_or("UNKNOWN", |category| category.as_str_name())
+}
+
+fn targeted_state_write_status_name(value: i32) -> &'static str {
+    TargetedStateWriteStatus::try_from(value).map_or("UNKNOWN", |status| status.as_str_name())
+}
+
 fn validation_status(error: impl std::fmt::Display) -> Status {
     tracing::error!(
         provider.stage = "response_validation",
@@ -2235,15 +2249,16 @@ fn validation_status(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
 }
 
-fn plex_status(error: PlexError) -> Status {
+fn plex_status(error: PlexError, operation: &'static str) -> Status {
+    let message = error.to_string();
     tracing::warn!(
         provider.stage = "plex_request",
+        provider.operation = operation,
         http.status_code = ?error.status().map(|status| status.as_u16()),
+        error.message = %message,
         "Plex request failed"
     );
-    Status::unavailable(
-        plex_failure(&error, "plex_request_failed", "The Plex request failed.").safe_message,
-    )
+    Status::unavailable(message)
 }
 
 #[cfg(test)]

@@ -769,6 +769,36 @@ async fn source_refresh_evicts_removed_libraries() {
 }
 
 #[tokio::test]
+async fn source_refresh_preserves_the_plex_http_failure() {
+    let server = MockServer::start().await;
+    let adapter = open_adapter(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/library/sections/all"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = match adapter
+        .read_catalog(Request::new(ReadCatalogRequest {
+            operation_id: b"failed-source-refresh".to_vec(),
+            source_key: Some(mapping::source_key("missing")),
+            mode: ReadMode::Full as i32,
+            prior_cursor: Vec::new(),
+            preferred_batch_size: 10,
+        }))
+        .await
+    {
+        Ok(_) => panic!("failed Plex source refresh unexpectedly started a read"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), Code::Unavailable);
+    assert!(error.message().contains("503 Service Unavailable"));
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn streams_an_authenticated_paginated_catalog() {
     let server = MockServer::start().await;
     let adapter = open_adapter(&server).await;
