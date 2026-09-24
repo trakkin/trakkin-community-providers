@@ -21,7 +21,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let launch = match read_launch_request(io::stdin().lock()) {
         Ok(launch) => launch,
         Err(error) => {
-            error!(provider.stage = "bootstrap", "provider failed to start");
+            error!(
+                provider.stage = "bootstrap",
+                error.message = %error,
+                "provider failed to start"
+            );
             return Err(error.into());
         }
     };
@@ -34,7 +38,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match serve_adapter(&launch, adapter, io::stdout(), shutdown).await {
         Ok(()) => Ok(()),
         Err(error) => {
-            error!(provider.stage = "serve", "provider stopped with an error");
+            error!(
+                provider.stage = "serve",
+                error.message = %error,
+                "provider stopped with an error"
+            );
             Err(error.into())
         }
     }
